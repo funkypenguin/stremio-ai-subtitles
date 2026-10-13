@@ -25,6 +25,21 @@ node server.js
 
 Put it behind HTTPS: Stremio apps only load addons over HTTPS (except on localhost).
 
+### Docker
+
+```sh
+docker build -t ai-subtitles .
+docker run -d -p 7311:7311 \
+  -e CONFIG_SECRET="$(openssl rand -hex 32)" \
+  -e PUBLIC_URL=https://subtitles.example.com \
+  -v ai-subtitles-cache:/app/cache \
+  ai-subtitles
+```
+
+Runs as a non-root user, has a healthcheck on `/health`, and keeps finished translations in
+`/app/cache` (mount a volume so they survive updates). Keep `CONFIG_SECRET` the same across
+restarts, or every existing install link stops working.
+
 ### BeamUp
 
 ```sh
