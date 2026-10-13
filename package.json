@@ -1,0 +1,19 @@
+{
+  "name": "stremio-ai-subtitles",
+  "version": "2.0.0",
+  "description": "Stremio addon that translates English subtitles into your language with your own AI.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": ["stremio", "stremio-addon", "subtitles", "translation", "ai"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/luizsilva-dev/stremio-ai-subtitles.git"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}

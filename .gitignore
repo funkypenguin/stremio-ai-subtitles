@@ -1,0 +1,6 @@
+.env
+cache/
+beamup.json
+node_modules/
+.playwright-mcp/
+*.png
