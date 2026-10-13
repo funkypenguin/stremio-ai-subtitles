@@ -49,3 +49,7 @@ Source subtitles come from OpenSubtitles through Stremio's public addon.
 ## Credits
 
 Language list from [Stremio/nodejs-langs](https://github.com/Stremio/nodejs-langs) (MIT).
+
+## License
+
+[MIT](LICENSE)
