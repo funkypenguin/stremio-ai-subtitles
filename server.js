@@ -39,7 +39,8 @@ const JOB_DEADLINE = 10 * 60000;         // a translation still running after th
 const CUSTOM_DEADLINE = 5 * 60000;       // same, on a custom endpoint
 const REAL_IP_HOPS = Math.max(1, Number(process.env.REAL_IP_HOPS || 1)); // proxies that append to REAL_IP_HEADER
 const MAX_ANSWER = 2 * 1048576;          // largest AI / metadata answer read
-const MAX_SOURCE = 16 * 1048576;         // largest source subtitle read
+const MAX_SOURCE = 4 * 1048576;          // largest source subtitle read (a feature film is ~100 KB)
+const MAX_CUES = 10000;                  // lines kept from one subtitle
 const CUSTOM_JOBS = 4;                   // of the MAX_JOBS slots, how many custom endpoints may hold
 const CUSTOM_TIMEOUT = 60000;            // per request to a custom endpoint
 const API_PER_IP = 2, API_TOTAL = 6;     // /api/models and /api/test running at once
@@ -202,11 +203,12 @@ function clientIp(req) {
 // the /48 around an IPv6 /64 bucket (tunnel brokers hand out whole /48s); IPv4 stays as it is
 const wideBucket = b => (b.endsWith('::/64') ? `${b.split(':').slice(0, 3).join(':')}::/48` : b);
 
-// keeps per-IP tables bounded even if someone sprays addresses between the regular cleanups
+// keeps per-IP tables bounded even if someone sprays addresses between the regular cleanups: expired entries go
+// first, then the least recently active (entries move to the end on every hit), never the whole table at once
 function capMap(map, alive) {
   if (map.size < MAP_CAP) return;
   for (const [k, v] of map) if (!alive(v)) map.delete(k);
-  if (map.size >= MAP_CAP) map.clear();
+  while (map.size >= MAP_CAP) map.delete(map.keys().next().value);
 }
 
 // sliding one-minute window per IP: lists and /api in ipHits, subtitle files in srtHits
@@ -216,7 +218,7 @@ function tooManyRequests(ip, table = ipHits, limit = REQS_PER_IP_MIN) {
   const now = Date.now();
   const list = (table.get(ip) || []).filter(t => now - t < 60000);
   list.push(now);
-  if (!table.has(ip)) capMap(table, l => l.some(t => now - t < 60000));
+  if (table.has(ip)) table.delete(ip); else capMap(table, l => l.some(t => now - t < 60000));
   table.set(ip, list);
   return list.length > limit;
 }
@@ -224,18 +226,15 @@ function tooManyRequests(ip, table = ipHits, limit = REQS_PER_IP_MIN) {
 // calls to OpenSubtitles and Cinemeta (lists, title info and source subtitle downloads): a small share per IP
 // inside one cap for all users, so neither one client nor many addresses can turn the server into a source of
 // traffic against them. Identical calls made at the same moment share one request and cost nothing extra.
-let upMinute = 0, upCount = 0;
 const inflight = new Map(); // url → promise
-const upHits = new Map();   // ip bucket (and its /48) → [timestamps]
+const upHits = new Map();   // ip bucket (and its /48) → [timestamps]; '*' counts everyone
 const busyError = () => Object.assign(userError('server busy, try again in a minute'), { busy: true });
 function fetchUpstream(url, timeoutMs, ip, opts = {}) {
   if (inflight.has(url)) return inflight.get(url);
   const wide = wideBucket(ip);
   if (tooManyRequests(ip, upHits, UPSTREAM_PER_IP_MIN) ||
       (wide !== ip && tooManyRequests(wide, upHits, UPSTREAM_PER_IP_MIN * 3))) return Promise.reject(busyError());
-  const minute = Math.floor(Date.now() / 60000);
-  if (minute !== upMinute) { upMinute = minute; upCount = 0; }
-  if (++upCount > UPSTREAM_PER_MIN) return Promise.reject(busyError());
+  if (tooManyRequests('*', upHits, UPSTREAM_PER_MIN)) return Promise.reject(busyError());
   const p = fetchText(url, opts, timeoutMs).finally(() => inflight.delete(url));
   inflight.set(url, p);
   return p;
@@ -271,7 +270,7 @@ function validConfig(c, strict = false) {
   const p = String(c.p || '');
   if (!PROVIDERS[p]) return fail('Choose an AI provider.');
   if (p === 'custom' && !ALLOW_CUSTOM) return fail('The custom provider is turned off on this server.');
-  const ctrl = /[\x00-\x1f\x7f]/; // control characters would break headers and forge log lines
+  const ctrl = /[\x00-\x1f\x7f-\x9f]/; // control characters would break headers and forge log lines
   const k = String(c.k || '').trim();
   if (!k || k.length > 400 || ctrl.test(k)) return fail('Enter your API key.');
   const m = String(c.m || PROVIDERS[p].model).trim();
@@ -367,12 +366,12 @@ async function chat(cfg, system, user, timeoutMs = 120000, deadline = Infinity, 
   return msg && typeof msg.content === 'string' ? msg.content : '';
 }
 
-async function listModels(cfg) {
+async function listModels(cfg, signal) {
   const base = baseUrl(cfg);
   const headers = PROVIDERS[cfg.p].native === 'anthropic'
     ? { 'x-api-key': cfg.k, 'anthropic-version': '2023-06-01' }
     : { 'Authorization': `Bearer ${cfg.k}` };
-  const data = parseAnswer(await fetchText(`${base}/models${cfg.p === 'anthropic' ? '?limit=100' : ''}`, { headers }, 15000, cfg.p === 'custom'));
+  const data = parseAnswer(await fetchText(`${base}/models${cfg.p === 'anthropic' ? '?limit=100' : ''}`, { headers, signal }, 15000, cfg.p === 'custom'));
   const list = Array.isArray(data) ? data : (data && (data.data || data.models)) || [];
   const ids = (Array.isArray(list) ? list : []).map(m => String((m && (m.id || m.name)) || '').replace(/^models\//, ''))
     .filter(id => id && id.length <= 120);
@@ -480,6 +479,7 @@ function parseSrt(text) {
   const blocks = text.replace(/^﻿/, '').replace(/\r/g, '').trim().split(/\n\s*\n/);
   const cues = [];
   for (const b of blocks) {
+    if (cues.length >= MAX_CUES) break;
     const lines = b.split('\n');
     const i = lines.findIndex(l => l.includes('-->'));
     if (i < 0) continue;
@@ -510,10 +510,13 @@ const UI = {
 const UI_BY_LANG = { pob: 'pt', por: 'pt', spa: 'es', spl: 'es', fre: 'fr', ger: 'de', ita: 'it' };
 const ui = lang => UI[UI_BY_LANG[lang] || 'en'];
 
+// OpenSubtitles metadata goes inside the subtitle: one short line, no breaks or control characters
+const oneLine = v => String(v || '').replace(/[\s\x00-\x1f\x7f-\x9f]+/g, ' ').trim().slice(0, 60);
+
 function describeSource(s, i, n, lang) {
   const t = ui(lang);
-  const group = (s.releaseGroup || '').replace(/\.(srt|txt|sub)$/i, '');
-  const first = [t.option(i + 1, n), s.releaseFormat, group].filter(Boolean).join(' · ');
+  const group = oneLine(s.releaseGroup).replace(/\.(srt|txt|sub)$/i, '');
+  const first = [t.option(i + 1, n), oneLine(s.releaseFormat), group].filter(Boolean).join(' · ');
   const extras = [];
   if (s.m === 'h') extras.push(t.matched);
   if (/[-._ ](HI|SDH)[-._ ]/i.test(s.subtitleFileName || '')) extras.push(t.sdh);
@@ -640,8 +643,12 @@ function progressSrt(cfg, key, info, blocked) {
   return noteSrt(lines, job && job.cues ? job.cues.filter(c => c.ok) : []);
 }
 
-// cleanup: deletes what hasn't been used for CACHE_TTL_HOURS and, above CACHE_MAX_MB, the least recently used
+// cleanup: deletes what hasn't been used for CACHE_TTL_HOURS and, above CACHE_MAX_MB, the least recently used.
+// A filesystem error is logged, never fatal.
 function cleanCache() {
+  try { cleanCacheNow(); } catch (e) { log('cache cleanup failed:', e.message); }
+}
+function cleanCacheNow() {
   const files = [];
   const walk = dir => {
     for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -901,7 +908,9 @@ $('save').onclick = async () => {
 async function readJson(req) {
   let body = '';
   for await (const chunk of req) { body += chunk; if (body.length > 20000) throw new Error('too large'); }
-  return JSON.parse(body || '{}');
+  const v = JSON.parse(body || '{}');
+  if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('not an object');
+  return v;
 }
 
 // builds the config from the form; an empty key reuses the one from the previous install, but only for the same
@@ -936,9 +945,12 @@ async function handleApi(req, res, name, ip) {
     const run = Symbol(ip);
     apiRunning.add(run);
     apiByIp.set(ip, (apiByIp.get(ip) || 0) + 1);
+    // a check whose page went away is cancelled, so it doesn't keep holding a slot
+    const gone = new AbortController();
+    res.on('close', () => { if (!res.writableFinished) gone.abort(); });
     try {
-      if (name === 'models') return reply(200, { models: await listModels(cfg) });
-      const out = await chat(cfg, systemPrompt(cfg.l, null), JSON.stringify({ 0: 'Hey, are you okay? The ambulance is on its way.' }), 45000);
+      if (name === 'models') return reply(200, { models: await listModels(cfg, gone.signal) });
+      const out = await chat(cfg, systemPrompt(cfg.l, null), JSON.stringify({ 0: 'Hey, are you okay? The ambulance is on its way.' }), 45000, Infinity, gone.signal);
       const json = parseAnswer(out.slice(out.indexOf('{'), out.lastIndexOf('}') + 1)) || {};
       if (typeof json[0] !== 'string') throw userError('the model did not answer in the expected format');
       return reply(200, { sample: json[0] });
