@@ -4,6 +4,7 @@
 'use strict';
 
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -19,9 +20,14 @@ const SECRET = process.env.CONFIG_SECRET || '';
 const REAL_IP_HEADER = (process.env.REAL_IP_HEADER || '').toLowerCase(); // e.g. cf-connecting-ip, x-real-ip
 const CACHE_DIR = path.join(__dirname, 'cache');
 const CACHE_MAX_MB = Number(process.env.CACHE_MAX_MB || 2000);
-const CACHE_MAX_DAYS = Number(process.env.CACHE_MAX_DAYS || 60);
+const CACHE_TTL_HOURS = Number(process.env.CACHE_TTL_HOURS || 24); // a translation is deleted this long after its last use
 const JOBS_PER_IP_HOUR = Number(process.env.JOBS_PER_IP_HOUR || 30);
 const MAX_JOBS = Number(process.env.MAX_JOBS || 10);
+const REQS_PER_IP_MIN = Number(process.env.REQS_PER_IP_MIN || 60); // subtitle lists and /api calls per IP per minute
+const ALLOW_CUSTOM = process.env.ALLOW_CUSTOM_PROVIDER !== 'false';
+const JOBS_PER_USER = 2;                 // concurrent translations per IP and per key
+const JOB_DEADLINE = 10 * 60000;         // a translation still running after this is dropped
+const MAX_BODY = 16 * 1048576;           // largest response read from any outbound request
 const OPENSUBS = 'https://opensubtitles-v3.strem.io';
 const CINEMETA = 'https://v3-cinemeta.strem.io'; // title name/genre/plot, to give the AI context
 const BATCH_SIZE = 50;         // lines per AI request
@@ -49,7 +55,7 @@ fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 const manifestBase = {
   id: 'dev.luizsilva.ai-subtitles',
-  version: '2.0.0',
+  version: '2.1.0',
   name: 'AI Subtitles',
   description: 'Translates English subtitles into your language with your own AI (OpenAI, Claude, Gemini, Groq, OpenRouter, DeepSeek, Mistral, Grok or any OpenAI-compatible endpoint).',
   resources: ['subtitles'],
@@ -73,22 +79,52 @@ function send(res, status, body, type = 'application/json; charset=utf-8', extra
   res.end(typeof body === 'string' ? body : JSON.stringify(body));
 }
 
-async function fetchText(url, opts = {}, timeoutMs = 30000) {
-  const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), timeoutMs);
-  try {
-    const r = await fetch(url, { ...opts, signal: ctl.signal });
-    const body = await r.text();
-    if (!r.ok) {
-      const err = new Error(`HTTP ${r.status}: ${body.slice(0, 200)}`);
-      err.status = r.status;
-      err.retryAfter = Number(r.headers.get('retry-after')) || 0;
-      throw err;
-    }
-    return body;
-  } finally {
-    clearTimeout(t);
-  }
+// an error whose message is safe to show to the user
+const userError = msg => Object.assign(new Error(msg), { expose: true });
+
+// every outbound request: https only, redirects refused, body capped at MAX_BODY. With guard (custom endpoints)
+// the address is checked by the same lookup the socket connects with, so DNS rebinding can't swap it afterwards.
+function fetchText(url, opts = {}, timeoutMs = 30000, guard = false) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try { u = new URL(url); } catch { return reject(userError('invalid address')); }
+    if (u.protocol !== 'https:') return reject(userError('only https:// addresses are allowed'));
+    const host = u.hostname.replace(/^\[|\]$/g, '');
+    if (guard && net.isIP(host) && !publicIp(host)) return reject(privateError());
+    let settled = false;
+    const finish = (err, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err) { req.destroy(); reject(err); } else resolve(val);
+    };
+    const headers = { ...(opts.headers || {}) };
+    if (opts.body) headers['Content-Length'] = Buffer.byteLength(opts.body);
+    const req = https.request(u, { method: opts.method || 'GET', headers, agent: guard ? guardedAgent : undefined }, res => {
+      const chunks = [];
+      let size = 0;
+      res.on('data', c => {
+        size += c.length;
+        if (size > MAX_BODY) return finish(userError('the answer was too large'));
+        chunks.push(c);
+      });
+      res.on('error', finish);
+      res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          const err = new Error(`HTTP ${res.statusCode}`);
+          err.status = res.statusCode;
+          err.retryAfter = Number(res.headers['retry-after']) || 0;
+          return finish(err);
+        }
+        finish(null, Buffer.concat(chunks).toString('utf8'));
+      });
+    });
+    const timer = setTimeout(() => finish(Object.assign(new Error('timeout'), { name: 'AbortError' })), timeoutMs);
+    req.on('error', finish);
+    req.on('close', () => finish(new Error('connection closed')));
+    if (opts.body) req.write(opts.body);
+    req.end();
+  });
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -96,6 +132,16 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 function clientIp(req) {
   const h = REAL_IP_HEADER && req.headers[REAL_IP_HEADER];
   return (h ? String(h).split(',')[0].trim() : '') || req.socket.remoteAddress || '?';
+}
+
+// sliding one-minute window per IP for requests that call other servers
+const ipHits = new Map(); // ip → [timestamps]
+function tooManyRequests(ip) {
+  const now = Date.now();
+  const list = (ipHits.get(ip) || []).filter(t => now - t < 60000);
+  list.push(now);
+  ipHits.set(ip, list);
+  return list.length > REQS_PER_IP_MIN;
 }
 
 // ---------- config in the link (AES-256-GCM) ----------
@@ -127,6 +173,7 @@ function validConfig(c, strict = false) {
   if (!c || typeof c !== 'object') return fail('Invalid configuration.');
   const p = String(c.p || '');
   if (!PROVIDERS[p]) return fail('Choose an AI provider.');
+  if (p === 'custom' && !ALLOW_CUSTOM) return fail('The custom provider is turned off on this server.');
   const k = String(c.k || '').trim();
   if (!k || k.length > 400) return fail('Enter your API key.');
   const m = String(c.m || PROVIDERS[p].model).trim();
@@ -145,40 +192,58 @@ function validConfig(c, strict = false) {
 
 // ---------- custom endpoint guard (never point at the internal network) ----------
 
-function privateIp(ip) {
-  if (net.isIPv4(ip)) {
-    const [a, b] = ip.split('.').map(Number);
-    return a === 10 || a === 127 || a === 0 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224;
-  }
-  const x = ip.toLowerCase();
-  if (x.startsWith('::ffff:')) return privateIp(x.slice(7));
-  return x === '::1' || x === '::' || x.startsWith('fc') || x.startsWith('fd') || x.startsWith('fe80');
+// IPv4: every special-purpose range (IANA registry). IPv6: only global unicast (2000::/3) minus the ranges that
+// can tunnel or embed another address, so ::ffff:…, NAT64 and friends never count as public.
+const BLOCKED_V4 = new net.BlockList();
+for (const [a, n] of [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16],
+  ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.88.99.0', 24], ['192.168.0.0', 16],
+  ['198.18.0.0', 15], ['198.51.100.0', 24], ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4]]) BLOCKED_V4.addSubnet(a, n, 'ipv4');
+const GLOBAL_V6 = new net.BlockList();
+GLOBAL_V6.addSubnet('2000::', 3, 'ipv6');
+const BLOCKED_V6 = new net.BlockList();
+for (const [a, n] of [['2001::', 23], ['2001:db8::', 32], ['2002::', 16], ['3fff::', 20]]) BLOCKED_V6.addSubnet(a, n, 'ipv6');
+
+function publicIp(ip) {
+  if (net.isIPv4(ip)) return !BLOCKED_V4.check(ip, 'ipv4');
+  if (net.isIPv6(ip)) return GLOBAL_V6.check(ip, 'ipv6') && !BLOCKED_V6.check(ip, 'ipv6');
+  return false;
 }
 
-const safeHosts = new Map(); // host → expiry
-async function assertPublicUrl(u) {
-  const host = new URL(u).hostname.replace(/^\[|\]$/g, '');
-  if ((safeHosts.get(host) || 0) > Date.now()) return;
-  const addrs = net.isIP(host) ? [{ address: host }] : await dns.lookup(host, { all: true });
-  if (!addrs.length || addrs.some(a => privateIp(a.address))) throw new Error('The custom endpoint must be a public address.');
-  safeHosts.set(host, Date.now() + 10 * 60000);
+const privateError = () => userError('the custom endpoint must be a public address');
+
+// used by the socket itself to resolve custom endpoints: refuses the connection if any address isn't public
+function guardedLookup(host, opts, cb) {
+  if (typeof opts === 'function') { cb = opts; opts = {}; }
+  if (typeof opts === 'number') opts = { family: opts };
+  dns.lookup(host, { all: true }).then(found => {
+    const addrs = opts.family ? found.filter(a => a.family === opts.family) : found;
+    if (!addrs.length || found.some(a => !publicIp(a.address))) return cb(privateError());
+    if (opts.all) cb(null, addrs);
+    else cb(null, addrs[0].address, addrs[0].family);
+  }, err => cb(err));
 }
+const guardedAgent = new https.Agent({ keepAlive: true, lookup: guardedLookup });
 
 // ---------- AI ----------
 
 const baseUrl = cfg => (cfg.p === 'custom' ? cfg.u : PROVIDERS[cfg.p].base);
 
+// parses an AI answer; a parse error never reaches the user (its message quotes the answer)
+function parseAnswer(raw) {
+  try { return JSON.parse(raw); } catch { throw Object.assign(userError('the AI answer could not be read'), { retry: true }); }
+}
+
 async function chat(cfg, system, user, timeoutMs = 120000) {
   const base = baseUrl(cfg);
-  if (cfg.p === 'custom') await assertPublicUrl(base);
+  const guard = cfg.p === 'custom';
   if (PROVIDERS[cfg.p].native === 'anthropic') {
     const raw = await fetchText(`${base}/messages`, {
       method: 'POST',
       headers: { 'x-api-key': cfg.k, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       body: JSON.stringify({ model: cfg.m, max_tokens: 16000, system, messages: [{ role: 'user', content: user }] }),
-    }, timeoutMs);
-    return (JSON.parse(raw).content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+    }, timeoutMs, guard);
+    const content = parseAnswer(raw).content;
+    return (Array.isArray(content) ? content : []).filter(b => b && b.type === 'text').map(b => String(b.text)).join('');
   }
   const raw = await fetchText(`${base}/chat/completions`, {
     method: 'POST',
@@ -188,31 +253,36 @@ async function chat(cfg, system, user, timeoutMs = 120000) {
       stream: false,
       messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
     }),
-  }, timeoutMs);
-  return JSON.parse(raw).choices[0].message.content || '';
+  }, timeoutMs, guard);
+  const msg = (((parseAnswer(raw) || {}).choices || [])[0] || {}).message;
+  return msg && typeof msg.content === 'string' ? msg.content : '';
 }
 
 async function listModels(cfg) {
   const base = baseUrl(cfg);
-  if (cfg.p === 'custom') await assertPublicUrl(base);
   const headers = PROVIDERS[cfg.p].native === 'anthropic'
     ? { 'x-api-key': cfg.k, 'anthropic-version': '2023-06-01' }
     : { 'Authorization': `Bearer ${cfg.k}` };
-  const data = JSON.parse(await fetchText(`${base}/models${cfg.p === 'anthropic' ? '?limit=100' : ''}`, { headers }, 15000));
-  const ids = (Array.isArray(data) ? data : data.data || data.models || []).map(m => String(m.id || m.name || '').replace(/^models\//, '')).filter(Boolean);
-  return [...new Set(ids)].sort();
+  const data = parseAnswer(await fetchText(`${base}/models${cfg.p === 'anthropic' ? '?limit=100' : ''}`, { headers }, 15000, cfg.p === 'custom'));
+  const list = Array.isArray(data) ? data : (data && (data.data || data.models)) || [];
+  const ids = (Array.isArray(list) ? list : []).map(m => String((m && (m.id || m.name)) || '').replace(/^models\//, ''))
+    .filter(id => id && id.length <= 120);
+  return [...new Set(ids)].sort().slice(0, 500);
 }
 
 // AI error in plain words (shown inside the subtitle and on the page)
 function friendlyError(e) {
+  if (e.expose) return e.message;
   if (e.status === 401 || e.status === 403) return 'invalid API key or no access to this model';
   if (e.status === 404) return 'model or endpoint not found';
   if (e.status === 429) return 'rate limit or no credits left on your AI account';
   if (e.status === 402) return 'no credits left on your AI account';
+  if (e.status >= 300 && e.status < 400) return 'the endpoint tried to redirect, which is not allowed';
   if (e.name === 'AbortError') return 'the AI took too long to answer';
   // the provider's error body is never passed on: some echo part of the key
   if (e.status) return `the AI answered with HTTP ${e.status}`;
-  return e.message.replace(/\.$/, '').slice(0, 160);
+  if (e.code === 'ENOTFOUND') return 'endpoint address not found';
+  return 'could not reach the AI';
 }
 
 const JARGON_PT = `
@@ -265,18 +335,23 @@ async function titleContext(type, id) {
   return ctx;
 }
 
-async function translateBatch(cfg, system, batch) {
+// a translated line much longer than its source is not a translation: keep the English instead
+const fits = (out, src) => typeof out === 'string' && out.trim() !== '' && out.length <= src.length * 4 + 40;
+
+async function translateBatch(cfg, system, batch, deadline) {
   const input = {};
   batch.forEach(c => { input[c.idx] = c.text; });
   let last;
   for (let attempt = 1; attempt <= 4; attempt++) {
+    if (Date.now() > deadline) throw userError('the translation took too long');
     try {
       const content = await chat(cfg, system, JSON.stringify(input));
-      const json = JSON.parse(content.slice(content.indexOf('{'), content.lastIndexOf('}') + 1));
-      return batch.map(c => (typeof json[c.idx] === 'string' && json[c.idx].trim()) ? json[c.idx] : c.text);
+      const json = parseAnswer(content.slice(content.indexOf('{'), content.lastIndexOf('}') + 1)) || {};
+      return batch.map(c => (fits(json[c.idx], c.text) ? json[c.idx] : c.text));
     } catch (e) {
       last = e;
-      if (e.status === 401 || e.status === 403 || e.status === 404 || e.status === 402) throw e; // retrying won't help
+      // retrying won't help (an unreadable answer is the only exposed error worth another try)
+      if ([401, 402, 403, 404].includes(e.status) || (e.status >= 300 && e.status < 400) || (e.expose && !e.retry)) throw e;
       await sleep(e.status === 429 ? Math.min(30, e.retryAfter || 5 * attempt) * 1000 : 1000 * attempt);
     }
   }
@@ -347,38 +422,46 @@ function withInfo(cues, info) {
 const noteSrt = (lines, extra = []) => buildSrt([{ time: '00:00:00,000 --> 00:00:10,000', text: lines.filter(Boolean).join('\n') }, ...extra]);
 
 // ---------- cache and jobs ----------
-// cache/{lang}/{key}.srt — shared across users; mtime marks the last use
+// cache/{user}/{lang}/{key}.srt — each user only ever sees their own translations; mtime marks the last use and
+// a file is deleted CACHE_TTL_HOURS after it. {user} is an HMAC of provider + endpoint + key, so it can't be guessed.
 
-const cachePath = (lang, key) => path.join(CACHE_DIR, lang, `${key}.srt`);
-const jobs = new Map();     // `${lang}/${key}` → { cues, done, total }
-const failures = new Map(); // `${lang}/${key}|${key owner}` → { msg, at } (shows the error for a few minutes, only to whoever caused it)
-const failId = (cfg, id) => `${id}|${crypto.createHash('sha256').update(cfg.k).digest('hex').slice(0, 16)}`;
+const userTag = cfg => crypto.createHmac('sha256', SECRET).update(`${cfg.p}|${cfg.u}|${cfg.k}`).digest('hex').slice(0, 32);
+const cachePath = (cfg, key) => path.join(CACHE_DIR, userTag(cfg), cfg.l, `${key}.srt`);
+const jobId = (cfg, key) => `${userTag(cfg)}/${cfg.l}/${key}`;
+const jobs = new Map();     // jobId → { cues, done, total, ip, user }
+const failures = new Map(); // jobId → { msg, at } (the error shows for a couple of minutes)
 const ipJobs = new Map();   // ip → [timestamps of started translations]
+let cacheBytes = 0;         // approximate size of the cache folder, checked against CACHE_MAX_MB on every write
 
-function canStart(ip) {
+function canStart(ip, user) {
   const now = Date.now();
   const list = (ipJobs.get(ip) || []).filter(t => now - t < 3600000);
   ipJobs.set(ip, list);
   if (list.length >= JOBS_PER_IP_HOUR) return 'limit';
-  if (jobs.size >= MAX_JOBS) return 'busy';
+  let byIp = 0, byUser = 0;
+  for (const j of jobs.values()) { if (j.ip === ip) byIp++; if (j.user === user) byUser++; }
+  if (jobs.size >= MAX_JOBS || byIp >= JOBS_PER_USER || byUser >= JOBS_PER_USER) return 'busy';
   list.push(now);
   return '';
 }
 
 function startTranslation(cfg, key, sourceUrl, ctx, ip) {
-  const id = `${cfg.l}/${key}`;
-  if (fs.existsSync(cachePath(cfg.l, key)) || jobs.has(id)) return '';
-  const f = failures.get(failId(cfg, id));
+  const id = jobId(cfg, key);
+  const file = cachePath(cfg, key);
+  if (fs.existsSync(file) || jobs.has(id)) return '';
+  const f = failures.get(id);
   if (f && Date.now() - f.at < 120000) return '';
-  const blocked = canStart(ip);
+  const user = userTag(cfg);
+  const blocked = canStart(ip, user);
   if (blocked) return blocked;
-  failures.delete(failId(cfg, id));
-  const job = { cues: null, done: 0, total: 0 };
+  failures.delete(id);
+  const job = { cues: null, done: 0, total: 0, ip, user };
   jobs.set(id, job);
+  const deadline = Date.now() + JOB_DEADLINE;
   (async () => {
     try {
       const cues = parseSrt(await fetchText(sourceUrl));
-      if (!cues.length) throw new Error('empty source subtitle');
+      if (!cues.length) throw userError('empty source subtitle');
       job.cues = cues.map(c => ({ ...c }));
       const batches = [];
       for (let i = 0; i < cues.length; i += BATCH_SIZE) {
@@ -386,24 +469,27 @@ function startTranslation(cfg, key, sourceUrl, ctx, ip) {
       }
       job.total = batches.length;
       const system = systemPrompt(cfg.l, ctx);
-      log(`translating ${id} (${cfg.p}/${cfg.m}): ${cues.length} lines, ${batches.length} batches`);
+      log(`translating ${cfg.l}/${key} (${cfg.p}/${cfg.m}): ${cues.length} lines, ${batches.length} batches`);
       let next = 0;
       const worker = async () => {
         while (next < batches.length) {
           const b = batches[next++];
-          const out = await translateBatch(cfg, system, b);
+          const out = await translateBatch(cfg, system, b, deadline);
           b.forEach((c, j) => { job.cues[c.idx].text = out[j]; job.cues[c.idx].ok = true; });
           job.done++;
         }
       };
       await Promise.all(Array.from({ length: PARALLEL }, worker));
-      fs.mkdirSync(path.join(CACHE_DIR, cfg.l), { recursive: true });
-      fs.writeFileSync(cachePath(cfg.l, key), buildSrt(job.cues));
-      log(`done ${id}`);
+      const srt = buildSrt(job.cues);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, srt);
+      cacheBytes += Buffer.byteLength(srt);
+      if (cacheBytes > CACHE_MAX_MB * 1048576) cleanCache();
+      log(`done ${cfg.l}/${key}`);
     } catch (e) {
-      log(`failed ${id} (${cfg.p}/${cfg.m}):`, e.status || '', friendlyError(e));
+      log(`failed ${cfg.l}/${key} (${cfg.p}/${cfg.m}):`, e.status || '', friendlyError(e));
       if (failures.size > 5000) failures.clear();
-      failures.set(failId(cfg, id), { msg: friendlyError(e), at: Date.now() });
+      failures.set(id, { msg: friendlyError(e), at: Date.now() });
     } finally {
       jobs.delete(id);
     }
@@ -413,9 +499,9 @@ function startTranslation(cfg, key, sourceUrl, ctx, ip) {
 
 function progressSrt(cfg, key, info, blocked) {
   const t = ui(cfg.l);
-  const id = `${cfg.l}/${key}`;
+  const id = jobId(cfg, key);
   if (blocked) return noteSrt([t[blocked]]);
-  const f = failures.get(failId(cfg, id));
+  const f = failures.get(id);
   if (f && Date.now() - f.at < 120000) return noteSrt([`${t.error}: ${f.msg}`, t.fix]);
   const job = jobs.get(id);
   const pct = job && job.total ? Math.round((job.done / job.total) * 100) : 0;
@@ -424,46 +510,67 @@ function progressSrt(cfg, key, info, blocked) {
   return noteSrt(lines, job && job.cues ? job.cues.filter(c => c.ok) : []);
 }
 
-// cleanup: deletes what hasn't been used for CACHE_MAX_DAYS and, above CACHE_MAX_MB, the oldest files
+// cleanup: deletes what hasn't been used for CACHE_TTL_HOURS and, above CACHE_MAX_MB, the least recently used
 function cleanCache() {
   const files = [];
-  for (const lang of fs.readdirSync(CACHE_DIR)) {
-    const dir = path.join(CACHE_DIR, lang);
-    if (!fs.statSync(dir).isDirectory()) continue;
-    for (const f of fs.readdirSync(dir)) {
-      const p = path.join(dir, f);
-      const st = fs.statSync(p);
-      files.push({ p, size: st.size, used: st.mtimeMs });
+  const walk = dir => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.isFile()) { const st = fs.statSync(p); files.push({ p, size: st.size, used: st.mtimeMs }); }
     }
-  }
-  const old = Date.now() - CACHE_MAX_DAYS * 86400000;
+  };
+  walk(CACHE_DIR);
+  const old = Date.now() - CACHE_TTL_HOURS * 3600000;
   let total = 0, removed = 0;
   files.sort((a, b) => b.used - a.used);
   for (const f of files) {
-    total += f.size;
-    if (f.used < old || total > CACHE_MAX_MB * 1048576) { fs.unlinkSync(f.p); removed++; }
+    if (f.used < old || total + f.size > CACHE_MAX_MB * 1048576 * 0.9) { fs.unlinkSync(f.p); removed++; } else total += f.size;
   }
+  // drop folders left empty
+  const prune = dir => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!e.isDirectory()) continue;
+      const p = path.join(dir, e.name);
+      prune(p);
+      if (!fs.readdirSync(p).length) fs.rmdirSync(p);
+    }
+  };
+  prune(CACHE_DIR);
+  cacheBytes = total;
   if (removed) log(`cache cleanup: removed ${removed} files`);
 }
 
 // ---------- Stremio routes ----------
 
-// key = source subtitle id on OpenSubtitles; the source URL is encoded in the link
+// key = hash of the source subtitle URL, which is encoded in the link; nothing else in the link names the file
 const encodeSrc = url => Buffer.from(url).toString('base64url');
 const decodeSrc = s => Buffer.from(s, 'base64url').toString();
-const keyFor = (osId, url) => `${osId}-${crypto.createHash('sha1').update(url).digest('hex').slice(0, 8)}`;
+const keyFor = url => crypto.createHash('sha256').update(url).digest('hex').slice(0, 24);
 
 // stored when Stremio asks for the list (before asking for the .srt): title context and option info
 const subMeta = new Map(); // `${lang}/${key}` → { ctx, info }
 
+// OpenSubtitles answers are reused for 10 minutes, so repeated requests don't hit them again
+const listCache = new Map(); // url → { at, subs }
+async function englishSubs(type, id, extra) {
+  const url = `${OPENSUBS}/subtitles/${type}/${encodeURIComponent(id)}${extra ? `/${extra}` : ''}.json`;
+  const hit = listCache.get(url);
+  if (hit && Date.now() - hit.at < 600000) return hit.subs;
+  const data = JSON.parse(await fetchText(url, {}, 20000));
+  const subs = (Array.isArray(data.subtitles) ? data.subtitles : [])
+    .filter(s => s && s.lang === 'eng' && typeof s.url === 'string' && /^https:\/\/[\w.-]+\.strem\.io\//.test(s.url));
+  if (listCache.size > 5000) listCache.clear();
+  listCache.set(url, { at: Date.now(), subs });
+  return subs;
+}
+
 async function handleSubtitles(cfg, token, type, id, extra, ip) {
-  const q = extra ? `/${extra}` : '';
-  const data = JSON.parse(await fetchText(`${OPENSUBS}/subtitles/${type}/${encodeURIComponent(id)}${q}.json`, {}, 20000));
-  const english = (data.subtitles || []).filter(s => s.lang === 'eng').slice(0, cfg.n);
+  const english = (await englishSubs(type, id, extra)).slice(0, cfg.n);
   const ctx = await titleContext(type, id);
   if (subMeta.size > 20000) subMeta.clear();
   return english.map((s, i) => {
-    const key = keyFor(s.id, s.url);
+    const key = keyFor(s.url);
     subMeta.set(`${cfg.l}/${key}`, { ctx, info: describeSource(s, i, english.length, cfg.l) });
     if (i === 0) startTranslation(cfg, key, s.url, ctx, ip); // start translating the best option right away
     return {
@@ -476,15 +583,18 @@ async function handleSubtitles(cfg, token, type, id, extra, ip) {
 
 function serveSub(res, cfg, key, src, ip) {
   const srt = 'application/x-subrip; charset=utf-8';
+  const srcUrl = decodeSrc(src);
+  // the key must belong to this source, so a translation can never be saved under another file's name
+  if (!/^https:\/\/[\w.-]+\.strem\.io\//.test(srcUrl) || keyFor(srcUrl) !== key) {
+    return send(res, 400, { error: 'invalid source' });
+  }
   const meta = subMeta.get(`${cfg.l}/${key}`) || {};
-  const file = cachePath(cfg.l, key);
+  const file = cachePath(cfg, key);
   if (fs.existsSync(file)) {
     const now = new Date();
     try { fs.utimesSync(file, now, now); } catch {}
     return send(res, 200, buildSrt(withInfo(parseSrt(fs.readFileSync(file, 'utf8')), meta.info)), srt);
   }
-  const srcUrl = decodeSrc(src);
-  if (!/^https:\/\/[\w.-]+\.strem\.io\//.test(srcUrl)) return send(res, 400, { error: 'invalid source' });
   const blocked = startTranslation(cfg, key, srcUrl, meta.ctx || null, ip);
   return send(res, 200, progressSrt(cfg, key, meta.info, blocked), srt);
 }
@@ -496,7 +606,8 @@ const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;'
 function configurePage(cfg, token) {
   const cur = cfg || { p: 'openai', m: '', u: '', l: 'pob', n: 1 };
   const opt = (v, label, sel) => `<option value="${esc(v)}"${sel ? ' selected' : ''}>${esc(label)}</option>`;
-  const providers = Object.entries(PROVIDERS).map(([id, p]) => opt(id, p.name, id === cur.p)).join('');
+  const providers = Object.entries(PROVIDERS).filter(([id]) => id !== 'custom' || ALLOW_CUSTOM)
+    .map(([id, p]) => opt(id, p.name, id === cur.p)).join('');
   const langs = LANGS.map(l => opt(l.code, l.local && l.local !== l.name ? `${l.name} — ${l.local}` : l.name, l.code === cur.l)).join('');
   const defaults = Object.fromEntries(Object.entries(PROVIDERS).map(([id, p]) => [id, p.model]));
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -552,7 +663,7 @@ ol,ul{margin:0;padding-left:20px;color:var(--mut)}li{margin-bottom:6px}
 <li>When you open a movie or episode, the addon picks the best English subtitles from OpenSubtitles.</li>
 <li>Your AI translates them in about 30 seconds. The first option starts right away.</li>
 <li>If it is still translating, the subtitle says so. Open it again in a moment.</li>
-<li>Finished translations are shared, so popular titles are often instant and free.</li>
+<li>Translations are kept only for you, and deleted ${esc(CACHE_TTL_HOURS)} hours after you last open them.</li>
 </ol></section>
 
 <section><h2>Notice</h2><ul>
@@ -583,7 +694,7 @@ async function call(path, btn) {
 $('load').onclick = async () => {
   const r = await call('${esc(PUBLIC_URL)}/api/models', $('load'));
   if (r.error) return show($('testmsg'), false, r.error);
-  $('models').innerHTML = r.models.map(m => '<option value="' + m.replace(/"/g, '&quot;') + '">').join('');
+  $('models').replaceChildren(...r.models.map(m => { const o = document.createElement('option'); o.value = m; return o; }));
   show($('testmsg'), true, r.models.length + ' models found. Tap the model field to pick one.');
 };
 $('test').onclick = async () => {
@@ -606,11 +717,15 @@ async function readJson(req) {
   return JSON.parse(body || '{}');
 }
 
-// builds the config from the form; an empty key reuses the one from the previous install
+// builds the config from the form; an empty key reuses the one from the previous install, but only for the same
+// provider and endpoint, so a leaked install link can't send the key somewhere else
 function configFromForm(f) {
+  if (String(f.k || '').trim()) return validConfig(f, true);
   const prev = f.prev ? openConfig(String(f.prev)) : null;
-  const k = String(f.k || '').trim() || (prev && prev.p === f.p ? prev.k : '');
-  return validConfig({ ...f, k }, true);
+  if (!prev) return validConfig(f, true);
+  const cfg = validConfig({ ...f, k: prev.k }, true);
+  if (cfg.p !== prev.p || cfg.u !== prev.u) throw new Error('Enter your API key again when you change the provider or endpoint.');
+  return cfg;
 }
 
 async function handleApi(req, res, name) {
@@ -628,8 +743,8 @@ async function handleApi(req, res, name) {
     if (name === 'models') return send(res, 200, { models: await listModels(cfg) });
     if (name === 'test') {
       const out = await chat(cfg, systemPrompt(cfg.l, null), JSON.stringify({ 0: 'Hey, are you okay? The ambulance is on its way.' }), 45000);
-      const json = JSON.parse(out.slice(out.indexOf('{'), out.lastIndexOf('}') + 1));
-      if (typeof json[0] !== 'string') throw new Error('the model did not answer in the expected format');
+      const json = parseAnswer(out.slice(out.indexOf('{'), out.lastIndexOf('}') + 1)) || {};
+      if (typeof json[0] !== 'string') throw userError('the model did not answer in the expected format');
       return send(res, 200, { sample: json[0] });
     }
   } catch (e) {
@@ -657,7 +772,10 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ...manifestBase, behaviorHints: { configurable: true, configurationRequired: true } });
     }
     let m = p.match(/^\/api\/(config|models|test)$/);
-    if (m && req.method === 'POST') return handleApi(req, res, m[1]);
+    if (m && req.method === 'POST') {
+      if (tooManyRequests(ip)) return send(res, 429, { error: 'Too many requests. Wait a minute and try again.' });
+      return handleApi(req, res, m[1]);
+    }
 
     // from here on: /{config}/...
     m = p.match(/^\/([A-Za-z0-9_-]{40,})(\/.*)$/);
@@ -678,6 +796,7 @@ const server = http.createServer(async (req, res) => {
     // /subtitles/{type}/{id}.json  or  /subtitles/{type}/{id}/{extra}.json
     m = rest.match(/^\/subtitles\/(movie|series)\/([^/]+?)(?:\/(.+))?\.json$/);
     if (m) {
+      if (tooManyRequests(ip)) return send(res, 200, { subtitles: [], cacheMaxAge: 0 });
       const subtitles = await handleSubtitles(cfg, token, m[1], decodeURIComponent(m[2]), m[3], ip);
       return send(res, 200, { subtitles, cacheMaxAge: 0 });
     }
@@ -693,7 +812,12 @@ const server = http.createServer(async (req, res) => {
 });
 
 if (SECRET.length < 32) { console.error('CONFIG_SECRET missing or too short (min 32 chars)'); process.exit(1); }
+if (!REAL_IP_HEADER) log('warning: REAL_IP_HEADER is not set. Behind a reverse proxy every user shares one IP and one rate limit.');
 cleanCache();
-setInterval(cleanCache, 6 * 3600000).unref();
-setInterval(() => { const now = Date.now(); for (const [ip, l] of ipJobs) if (!l.some(t => now - t < 3600000)) ipJobs.delete(ip); }, 600000).unref();
+setInterval(cleanCache, 3600000).unref();
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, l] of ipJobs) if (!l.some(t => now - t < 3600000)) ipJobs.delete(ip);
+  for (const [ip, l] of ipHits) if (!l.some(t => now - t < 60000)) ipHits.delete(ip);
+}, 600000).unref();
 server.listen(PORT, HOST, () => log(`AI Subtitles on ${PUBLIC_URL}/configure`));
