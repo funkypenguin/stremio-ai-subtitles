@@ -23,7 +23,8 @@ const CACHE_MAX_MB = Number(process.env.CACHE_MAX_MB || 2000);
 const CACHE_TTL_HOURS = Number(process.env.CACHE_TTL_HOURS || 24); // a translation is deleted this long after its last use
 const JOBS_PER_IP_HOUR = Number(process.env.JOBS_PER_IP_HOUR || 30);
 const MAX_JOBS = Number(process.env.MAX_JOBS || 10);
-const REQS_PER_IP_MIN = Number(process.env.REQS_PER_IP_MIN || 60); // subtitle lists and /api calls per IP per minute
+const REQS_PER_IP_MIN = Number(process.env.REQS_PER_IP_MIN || 60); // per IP per minute: lists and /api, and separately .srt files
+const UPSTREAM_PER_MIN = Number(process.env.UPSTREAM_PER_MIN || 120); // OpenSubtitles + Cinemeta calls per minute, all users together
 const ALLOW_CUSTOM = process.env.ALLOW_CUSTOM_PROVIDER !== 'false';
 const JOBS_PER_USER = 2;                 // concurrent translations per IP and per key
 const JOB_DEADLINE = 10 * 60000;         // a translation still running after this is dropped
@@ -34,6 +35,7 @@ const CUSTOM_JOBS = 4;                   // of the MAX_JOBS slots, how many cust
 const CUSTOM_TIMEOUT = 60000;            // per request to a custom endpoint
 const API_PER_IP = 2, API_TOTAL = 6;     // /api/models and /api/test running at once
 const MAP_CAP = 50000;                   // most entries kept in any per-IP table
+const SRT_MEMORY = 64 * 1048576;         // finished subtitles kept ready in memory
 const OPENSUBS = 'https://opensubtitles-v3.strem.io';
 const CINEMETA = 'https://v3-cinemeta.strem.io'; // title name/genre/plot, to give the AI context
 const BATCH_SIZE = 50;         // lines per AI request
@@ -89,7 +91,7 @@ function send(res, status, body, type = 'application/json; charset=utf-8', extra
   };
   for (const k of Object.keys(headers)) if (headers[k] === undefined) delete headers[k];
   res.writeHead(status, headers);
-  res.end(typeof body === 'string' ? body : JSON.stringify(body));
+  res.end(typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body));
 }
 
 // an error whose message is safe to show to the user
@@ -178,15 +180,30 @@ function capMap(map, alive) {
   if (map.size >= MAP_CAP) map.clear();
 }
 
-// sliding one-minute window per IP for requests that call other servers
+// sliding one-minute window per IP: lists and /api in ipHits, subtitle files in srtHits
 const ipHits = new Map(); // ip → [timestamps]
-function tooManyRequests(ip) {
+const srtHits = new Map();
+function tooManyRequests(ip, table = ipHits) {
   const now = Date.now();
-  const list = (ipHits.get(ip) || []).filter(t => now - t < 60000);
+  const list = (table.get(ip) || []).filter(t => now - t < 60000);
   list.push(now);
-  if (!ipHits.has(ip)) capMap(ipHits, l => l.some(t => now - t < 60000));
-  ipHits.set(ip, list);
+  if (!table.has(ip)) capMap(table, l => l.some(t => now - t < 60000));
+  table.set(ip, list);
   return list.length > REQS_PER_IP_MIN;
+}
+
+// calls to OpenSubtitles and Cinemeta: one cap for all users together, so many addresses can't turn the server
+// into a source of traffic against them; identical calls made at the same moment share one request
+let upMinute = 0, upCount = 0;
+const inflight = new Map(); // url → promise
+function fetchUpstream(url, timeoutMs) {
+  if (inflight.has(url)) return inflight.get(url);
+  const minute = Math.floor(Date.now() / 60000);
+  if (minute !== upMinute) { upMinute = minute; upCount = 0; }
+  if (++upCount > UPSTREAM_PER_MIN) return Promise.reject(Object.assign(new Error('upstream limit reached'), { busy: true }));
+  const p = fetchText(url, {}, timeoutMs).finally(() => inflight.delete(url));
+  inflight.set(url, p);
+  return p;
 }
 
 // ---------- config in the link (AES-256-GCM) ----------
@@ -371,13 +388,14 @@ async function titleContext(type, id) {
   if (metaCache.has(imdb)) return metaCache.get(imdb);
   let ctx = null;
   try {
-    const { meta } = JSON.parse(await fetchText(`${CINEMETA}/meta/${type}/${imdb}.json`, {}, 8000));
+    const { meta } = JSON.parse(await fetchUpstream(`${CINEMETA}/meta/${type}/${imdb}.json`, 8000));
     if (meta && meta.name) {
       ctx = `Title: ${meta.name}${meta.year ? ` (${meta.year})` : ''}` +
         (meta.genre && meta.genre.length ? `\nGenre: ${meta.genre.join(', ')}` : '') +
         (meta.description ? `\nPlot: ${meta.description}` : '');
     }
   } catch (e) {
+    if (e.busy) return null; // not remembered: try again on the next request
     log(`no context for ${imdb}:`, e.message);
   }
   if (metaCache.size > 5000) metaCache.clear();
@@ -592,6 +610,9 @@ function cleanCache() {
   };
   prune(CACHE_DIR);
   cacheBytes = total;
+  ready.clear();
+  readyBytes = 0;
+  touched.clear();
   if (removed) log(`cache cleanup: removed ${removed} files`);
 }
 
@@ -611,7 +632,13 @@ async function englishSubs(type, id, extra) {
   const url = `${OPENSUBS}/subtitles/${type}/${encodeURIComponent(id)}${extra ? `/${extra}` : ''}.json`;
   const hit = listCache.get(url);
   if (hit && Date.now() - hit.at < 600000) return hit.subs;
-  const data = JSON.parse(await fetchText(url, {}, 20000));
+  let data;
+  try {
+    data = JSON.parse(await fetchUpstream(url, 20000));
+  } catch (e) {
+    if (e.busy) return []; // over the shared cap: an empty list now, a fresh try on the next request
+    throw e;
+  }
   const subs = (Array.isArray(data.subtitles) ? data.subtitles : [])
     .filter(s => s && s.lang === 'eng' && typeof s.url === 'string' && /^https:\/\/[\w.-]+\.strem\.io\//.test(s.url));
   if (listCache.size > 5000) listCache.clear();
@@ -635,8 +662,34 @@ async function handleSubtitles(cfg, token, type, id, extra, ip) {
   });
 }
 
-function serveSub(res, cfg, key, src, ip) {
+// finished subtitles ready to send: a file is read and rebuilt once, not on every request (least recently used go first)
+const ready = new Map(); // `${file}\n${info}` → { body (bytes), size }
+let readyBytes = 0;
+function remember(k, body) {
+  const size = body.length;
+  if (size > SRT_MEMORY / 4) return;
+  while (readyBytes + size > SRT_MEMORY && ready.size) {
+    const [old, v] = ready.entries().next().value;
+    ready.delete(old);
+    readyBytes -= v.size;
+  }
+  ready.set(k, { body, size });
+  readyBytes += size;
+}
+
+// mtime marks the last use; refreshed at most every 10 minutes, off the request path
+const touched = new Map(); // file → last refresh
+function touch(file) {
+  const now = Date.now();
+  if (now - (touched.get(file) || 0) < 600000) return;
+  if (touched.size > 20000) touched.clear();
+  touched.set(file, now);
+  fs.promises.utimes(file, new Date(now), new Date(now)).catch(() => {});
+}
+
+async function serveSub(res, cfg, key, src, ip) {
   const srt = 'application/x-subrip; charset=utf-8';
+  if (tooManyRequests(ip, srtHits)) return send(res, 200, noteSrt([ui(cfg.l).busy]), srt);
   const srcUrl = decodeSrc(src);
   // the key must belong to this source, so a translation can never be saved under another file's name
   if (!/^https:\/\/[\w.-]+\.strem\.io\//.test(srcUrl) || keyFor(srcUrl) !== key) {
@@ -644,10 +697,22 @@ function serveSub(res, cfg, key, src, ip) {
   }
   const meta = subMeta.get(`${cfg.l}/${key}`) || {};
   const file = cachePath(cfg, key);
-  if (fs.existsSync(file)) {
-    const now = new Date();
-    try { fs.utimesSync(file, now, now); } catch {}
-    return send(res, 200, buildSrt(withInfo(parseSrt(fs.readFileSync(file, 'utf8')), meta.info)), srt);
+  const k = `${file}\n${meta.info || ''}`;
+  let hit = ready.get(k);
+  if (hit) {
+    ready.delete(k);
+    ready.set(k, hit);
+  } else {
+    let text = null;
+    try { text = await fs.promises.readFile(file, 'utf8'); } catch {}
+    if (text !== null) {
+      hit = { body: Buffer.from(buildSrt(withInfo(parseSrt(text), meta.info))) };
+      remember(k, hit.body);
+    }
+  }
+  if (hit) {
+    touch(file);
+    return send(res, 200, hit.body, srt);
   }
   const blocked = startTranslation(cfg, key, srcUrl, meta.ctx || null, ip);
   return send(res, 200, progressSrt(cfg, key, meta.info, blocked), srt);
@@ -822,8 +887,17 @@ const apiByIp = new Map(); // ip → calls running
 
 // ---------- server ----------
 
+// without REAL_IP_HEADER, traffic from a private address usually means a proxy in front and one shared rate limit
+let warnedProxy = false;
 const server = http.createServer(async (req, res) => {
   const ip = clientIp(req);
+  if (!REAL_IP_HEADER && !warnedProxy) {
+    const peer = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+    if (net.isIP(peer) && !publicIp(peer)) {
+      warnedProxy = true;
+      log(`warning: requests arrive from ${peer} and REAL_IP_HEADER is not set. If a reverse proxy is in front, every user shares that address and one rate limit.`);
+    }
+  }
   try {
     const url = new URL(req.url, 'http://x');
     // accept with or without the prefix (the proxy may pass the full path)
@@ -874,7 +948,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     m = rest.match(/^\/sub\/([\w-]+)\/([\w-]+)\.srt$/);
-    if (m) return serveSub(res, cfg, m[1], m[2], ip);
+    if (m) return await serveSub(res, cfg, m[1], m[2], ip);
 
     send(res, 404, { error: 'not found' });
   } catch (e) {
@@ -890,6 +964,6 @@ setInterval(cleanCache, 3600000).unref();
 setInterval(() => {
   const now = Date.now();
   for (const [ip, l] of ipJobs) if (!l.some(t => now - t < 3600000)) ipJobs.delete(ip);
-  for (const [ip, l] of ipHits) if (!l.some(t => now - t < 60000)) ipHits.delete(ip);
+  for (const t of [ipHits, srtHits]) for (const [ip, l] of t) if (!l.some(x => now - x < 60000)) t.delete(ip);
 }, 600000).unref();
 server.listen(PORT, HOST, () => log(`AI Subtitles on ${PUBLIC_URL}/configure`));

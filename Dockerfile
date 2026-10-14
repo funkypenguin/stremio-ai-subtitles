@@ -9,6 +9,8 @@ RUN mkdir -p cache && chown node:node cache
 
 USER node
 EXPOSE 7311
+# behind a reverse proxy, also pass REAL_IP_HEADER (e.g. -e REAL_IP_HEADER=x-real-ip),
+# otherwise every user shares the proxy's address and one rate limit
 # finished translations (mount a volume so they survive updates)
 VOLUME /app/cache
 

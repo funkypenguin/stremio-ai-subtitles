@@ -33,9 +33,13 @@ docker build -t ai-subtitles .
 docker run -d -p 7311:7311 \
   -e CONFIG_SECRET="$(openssl rand -hex 32)" \
   -e PUBLIC_URL=https://subtitles.example.com \
+  -e REAL_IP_HEADER=x-real-ip \
   -v ai-subtitles-cache:/app/cache \
   ai-subtitles
 ```
+
+Set `REAL_IP_HEADER` to the header your reverse proxy writes (see below); without it, every user
+shares the proxy's address and one rate limit.
 
 Runs as a non-root user, has a healthcheck on `/health`, and keeps finished translations in
 `/app/cache` (mount a volume so they survive updates). Keep `CONFIG_SECRET` the same across
@@ -71,7 +75,8 @@ Read this before opening your instance to other people.
 | `CACHE_MAX_MB` | `2000` | Disk cap for translations; the least recently used go first. |
 | `JOBS_PER_IP_HOUR` | `30` | New translations per IP per hour. |
 | `MAX_JOBS` | `10` | Translations running at once (at most 2 per IP, 2 per key and 4 on custom endpoints). |
-| `REQS_PER_IP_MIN` | `60` | Subtitle lists and `/api` calls per IP per minute. |
+| `REQS_PER_IP_MIN` | `60` | Per IP per minute: subtitle lists and `/api` calls, and separately subtitle files. |
+| `UPSTREAM_PER_MIN` | `120` | Calls to OpenSubtitles and Cinemeta per minute, all users together. |
 
 ### BeamUp
 
