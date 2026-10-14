@@ -50,10 +50,13 @@ Read this before opening your instance to other people.
   access logs store full URLs. Keep the secret private, and strip or hash request paths in your
   proxy logs.
 - **Set `REAL_IP_HEADER`.** Behind a reverse proxy, every user otherwise shares one IP and one rate
-  limit. Your proxy must overwrite that header, not append to it, or users can fake their IP.
+  limit. Prefer a header your proxy overwrites (`x-real-ip`, `cf-connecting-ip`). With
+  `x-forwarded-for`, which proxies append to, the IP is read from the right; set `REAL_IP_HOPS`
+  to the number of proxies in front of the app, or users can fake their IP.
 - **The custom provider makes outbound requests to URLs your users choose.** Private and reserved
   addresses, redirects and oversized answers are refused, but set `ALLOW_CUSTOM_PROVIDER=false`
-  if you don't want that at all.
+  if you don't want that at all. Don't route outbound traffic through an HTTP proxy
+  (`NODE_USE_ENV_PROXY`): the address check would then see the proxy, not the endpoint.
 - **Translations are never shared between users.** Each user's translations live in their own
   folder and are deleted `CACHE_TTL_HOURS` after their last use.
 
@@ -62,11 +65,12 @@ Read this before opening your instance to other people.
 | `CONFIG_SECRET` | required | Encrypts install links (32+ chars). Changing it breaks every install. |
 | `PUBLIC_URL` | `http://HOST:PORT` | Public HTTPS address, with the path if it lives in a subfolder. |
 | `REAL_IP_HEADER` | none | Header with the client IP set by your proxy. |
+| `REAL_IP_HOPS` | `1` | How many proxies append to that header; the IP is read that many places from the right. |
 | `ALLOW_CUSTOM_PROVIDER` | `true` | Offer the custom OpenAI-compatible endpoint. |
 | `CACHE_TTL_HOURS` | `24` | Delete a translation this long after its last use. |
 | `CACHE_MAX_MB` | `2000` | Disk cap for translations; the least recently used go first. |
 | `JOBS_PER_IP_HOUR` | `30` | New translations per IP per hour. |
-| `MAX_JOBS` | `10` | Translations running at once (at most 2 per IP and per key). |
+| `MAX_JOBS` | `10` | Translations running at once (at most 2 per IP, 2 per key and 4 on custom endpoints). |
 | `REQS_PER_IP_MIN` | `60` | Subtitle lists and `/api` calls per IP per minute. |
 
 ### BeamUp
@@ -78,6 +82,7 @@ beamup init ai-subtitles
 beamup secrets CONFIG_SECRET "$(openssl rand -hex 32)"
 beamup secrets PUBLIC_URL https://<your-project-url>   # printed by the first deploy
 beamup secrets REAL_IP_HEADER x-forwarded-for
+beamup secrets REAL_IP_HOPS 1   # raise it if BeamUp has more than one proxy in front of the app
 beamup
 ```
 

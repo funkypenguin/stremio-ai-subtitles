@@ -27,7 +27,13 @@ const REQS_PER_IP_MIN = Number(process.env.REQS_PER_IP_MIN || 60); // subtitle l
 const ALLOW_CUSTOM = process.env.ALLOW_CUSTOM_PROVIDER !== 'false';
 const JOBS_PER_USER = 2;                 // concurrent translations per IP and per key
 const JOB_DEADLINE = 10 * 60000;         // a translation still running after this is dropped
-const MAX_BODY = 16 * 1048576;           // largest response read from any outbound request
+const REAL_IP_HOPS = Math.max(1, Number(process.env.REAL_IP_HOPS || 1)); // proxies that append to REAL_IP_HEADER
+const MAX_ANSWER = 2 * 1048576;          // largest AI / metadata answer read
+const MAX_SOURCE = 16 * 1048576;         // largest source subtitle read
+const CUSTOM_JOBS = 4;                   // of the MAX_JOBS slots, how many custom endpoints may hold
+const CUSTOM_TIMEOUT = 60000;            // per request to a custom endpoint
+const API_PER_IP = 2, API_TOTAL = 6;     // /api/models and /api/test running at once
+const MAP_CAP = 50000;                   // most entries kept in any per-IP table
 const OPENSUBS = 'https://opensubtitles-v3.strem.io';
 const CINEMETA = 'https://v3-cinemeta.strem.io'; // title name/genre/plot, to give the AI context
 const BATCH_SIZE = 50;         // lines per AI request
@@ -68,23 +74,32 @@ const manifestBase = {
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
+// Stremio apps load the addon routes cross-origin, so those allow any origin; the /api routes pass NO_CORS
+const NO_CORS = { 'Access-Control-Allow-Origin': undefined, 'Access-Control-Allow-Headers': undefined };
+const PUBLIC_ORIGIN = new URL(PUBLIC_URL).origin;
+
 function send(res, status, body, type = 'application/json; charset=utf-8', extra = {}) {
-  res.writeHead(status, {
+  const headers = {
     'Content-Type': type,
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': '*',
     'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
     ...extra,
-  });
+  };
+  for (const k of Object.keys(headers)) if (headers[k] === undefined) delete headers[k];
+  res.writeHead(status, headers);
   res.end(typeof body === 'string' ? body : JSON.stringify(body));
 }
 
 // an error whose message is safe to show to the user
 const userError = msg => Object.assign(new Error(msg), { expose: true });
 
-// every outbound request: https only, redirects refused, body capped at MAX_BODY. With guard (custom endpoints)
-// the address is checked by the same lookup the socket connects with, so DNS rebinding can't swap it afterwards.
+// every outbound request: https only, redirects refused, body capped (opts.maxBytes, MAX_ANSWER by default). With
+// guard (custom endpoints) the address is checked by the same lookup the socket connects with, so DNS rebinding
+// can't swap it afterwards.
 function fetchText(url, opts = {}, timeoutMs = 30000, guard = false) {
+  const maxBytes = opts.maxBytes || MAX_ANSWER;
   return new Promise((resolve, reject) => {
     let u;
     try { u = new URL(url); } catch { return reject(userError('invalid address')); }
@@ -105,7 +120,7 @@ function fetchText(url, opts = {}, timeoutMs = 30000, guard = false) {
       let size = 0;
       res.on('data', c => {
         size += c.length;
-        if (size > MAX_BODY) return finish(userError('the answer was too large'));
+        if (size > maxBytes) return finish(userError('the answer was too large'));
         chunks.push(c);
       });
       res.on('error', finish);
@@ -119,7 +134,7 @@ function fetchText(url, opts = {}, timeoutMs = 30000, guard = false) {
         finish(null, Buffer.concat(chunks).toString('utf8'));
       });
     });
-    const timer = setTimeout(() => finish(Object.assign(new Error('timeout'), { name: 'AbortError' })), timeoutMs);
+    const timer = setTimeout(() => finish(Object.assign(new Error('timeout'), { name: 'AbortError' })), Math.max(1, timeoutMs));
     req.on('error', finish);
     req.on('close', () => finish(new Error('connection closed')));
     if (opts.body) req.write(opts.body);
@@ -129,9 +144,38 @@ function fetchText(url, opts = {}, timeoutMs = 30000, guard = false) {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// IPv6 users get a whole /64, so limits count the /64, not the address
+function ipBucket(ip) {
+  const v4 = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  if (v4) return v4[1];
+  if (!net.isIPv6(ip)) return ip;
+  const [head, tail = ''] = ip.toLowerCase().split('::');
+  const h = head ? head.split(':') : [], t = tail ? tail.split(':') : [];
+  const full = ip.includes('::') ? [...h, ...Array(8 - h.length - t.length).fill('0'), ...t] : h;
+  return `${full.slice(0, 4).map(x => x.padStart(4, '0')).join(':')}::/64`;
+}
+
+// a proxy appends the address it saw to the right end of the header; values to its left come from the client
+let warnedMulti = false;
 function clientIp(req) {
   const h = REAL_IP_HEADER && req.headers[REAL_IP_HEADER];
-  return (h ? String(h).split(',')[0].trim() : '') || req.socket.remoteAddress || '?';
+  let ip = '';
+  if (h) {
+    const list = String(h).split(',').map(s => s.trim()).filter(Boolean);
+    if (list.length > 1 && REAL_IP_HOPS === 1 && !warnedMulti) {
+      warnedMulti = true;
+      log(`warning: ${REAL_IP_HEADER} has several values; using the last one. Set REAL_IP_HOPS if more than one proxy appends to it.`);
+    }
+    ip = list[list.length - REAL_IP_HOPS] || '';
+  }
+  return ipBucket(ip || req.socket.remoteAddress || '?');
+}
+
+// keeps per-IP tables bounded even if someone sprays addresses between the regular cleanups
+function capMap(map, alive) {
+  if (map.size < MAP_CAP) return;
+  for (const [k, v] of map) if (!alive(v)) map.delete(k);
+  if (map.size >= MAP_CAP) map.clear();
 }
 
 // sliding one-minute window per IP for requests that call other servers
@@ -140,6 +184,7 @@ function tooManyRequests(ip) {
   const now = Date.now();
   const list = (ipHits.get(ip) || []).filter(t => now - t < 60000);
   list.push(now);
+  if (!ipHits.has(ip)) capMap(ipHits, l => l.some(t => now - t < 60000));
   ipHits.set(ip, list);
   return list.length > REQS_PER_IP_MIN;
 }
@@ -174,14 +219,15 @@ function validConfig(c, strict = false) {
   const p = String(c.p || '');
   if (!PROVIDERS[p]) return fail('Choose an AI provider.');
   if (p === 'custom' && !ALLOW_CUSTOM) return fail('The custom provider is turned off on this server.');
+  const ctrl = /[\x00-\x1f\x7f]/; // control characters would break headers and forge log lines
   const k = String(c.k || '').trim();
-  if (!k || k.length > 400) return fail('Enter your API key.');
+  if (!k || k.length > 400 || ctrl.test(k)) return fail('Enter your API key.');
   const m = String(c.m || PROVIDERS[p].model).trim();
-  if (!m || m.length > 120) return fail('Enter a model name.');
+  if (!m || m.length > 120 || ctrl.test(m)) return fail('Enter a model name.');
   let u = '';
   if (p === 'custom') {
     u = String(c.u || '').trim().replace(/\/+$/, '').replace(/\/chat\/completions$/, '');
-    if (!/^https:\/\/[^\s/]+(\/\S*)?$/.test(u) || u.length > 300) return fail('The custom endpoint must be an https:// URL.');
+    if (!/^https:\/\/[^\s/]+(\/\S*)?$/.test(u) || u.length > 300 || ctrl.test(u)) return fail('The custom endpoint must be an https:// URL.');
   }
   const l = String(c.l || '');
   if (!LANG[l]) return fail('Choose a language.');
@@ -209,7 +255,8 @@ function publicIp(ip) {
   return false;
 }
 
-const privateError = () => userError('the custom endpoint must be a public address');
+// the same message whether the name doesn't exist or points inside, so internal names can't be probed
+const privateError = () => userError('the custom endpoint must be a reachable public address');
 
 // used by the socket itself to resolve custom endpoints: refuses the connection if any address isn't public
 function guardedLookup(host, opts, cb) {
@@ -220,9 +267,10 @@ function guardedLookup(host, opts, cb) {
     if (!addrs.length || found.some(a => !publicIp(a.address))) return cb(privateError());
     if (opts.all) cb(null, addrs);
     else cb(null, addrs[0].address, addrs[0].family);
-  }, err => cb(err));
+  }, () => cb(privateError()));
 }
-const guardedAgent = new https.Agent({ keepAlive: true, lookup: guardedLookup });
+// no keep-alive: a socket to a custom host closes with its request, so idle connections can't pile up
+const guardedAgent = new https.Agent({ keepAlive: false, maxTotalSockets: 50, lookup: guardedLookup });
 
 // ---------- AI ----------
 
@@ -233,9 +281,11 @@ function parseAnswer(raw) {
   try { return JSON.parse(raw); } catch { throw Object.assign(userError('the AI answer could not be read'), { retry: true }); }
 }
 
-async function chat(cfg, system, user, timeoutMs = 120000) {
+// deadline (optional) cuts the request when the whole translation runs out of time
+async function chat(cfg, system, user, timeoutMs = 120000, deadline = Infinity) {
   const base = baseUrl(cfg);
   const guard = cfg.p === 'custom';
+  timeoutMs = Math.min(timeoutMs, guard ? CUSTOM_TIMEOUT : timeoutMs, deadline - Date.now());
   if (PROVIDERS[cfg.p].native === 'anthropic') {
     const raw = await fetchText(`${base}/messages`, {
       method: 'POST',
@@ -281,7 +331,6 @@ function friendlyError(e) {
   if (e.name === 'AbortError') return 'the AI took too long to answer';
   // the provider's error body is never passed on: some echo part of the key
   if (e.status) return `the AI answered with HTTP ${e.status}`;
-  if (e.code === 'ENOTFOUND') return 'endpoint address not found';
   return 'could not reach the AI';
 }
 
@@ -318,6 +367,7 @@ the same ids, each value being the translation. Do not merge or skip ids.` +
 const metaCache = new Map();
 async function titleContext(type, id) {
   const imdb = id.split(':')[0];
+  if (!/^tt\d{1,12}$/.test(imdb)) return null;
   if (metaCache.has(imdb)) return metaCache.get(imdb);
   let ctx = null;
   try {
@@ -345,13 +395,15 @@ async function translateBatch(cfg, system, batch, deadline) {
   for (let attempt = 1; attempt <= 4; attempt++) {
     if (Date.now() > deadline) throw userError('the translation took too long');
     try {
-      const content = await chat(cfg, system, JSON.stringify(input));
+      const content = await chat(cfg, system, JSON.stringify(input), 120000, deadline);
       const json = parseAnswer(content.slice(content.indexOf('{'), content.lastIndexOf('}') + 1)) || {};
       return batch.map(c => (fits(json[c.idx], c.text) ? json[c.idx] : c.text));
     } catch (e) {
       last = e;
       // retrying won't help (an unreadable answer is the only exposed error worth another try)
       if ([401, 402, 403, 404].includes(e.status) || (e.status >= 300 && e.status < 400) || (e.expose && !e.retry)) throw e;
+      // a custom endpoint that already sat on a request for a full minute doesn't get another one
+      if (e.name === 'AbortError' && (cfg.p === 'custom' || Date.now() >= deadline)) throw e;
       await sleep(e.status === 429 ? Math.min(30, e.retryAfter || 5 * attempt) * 1000 : 1000 * attempt);
     }
   }
@@ -433,14 +485,15 @@ const failures = new Map(); // jobId → { msg, at } (the error shows for a coup
 const ipJobs = new Map();   // ip → [timestamps of started translations]
 let cacheBytes = 0;         // approximate size of the cache folder, checked against CACHE_MAX_MB on every write
 
-function canStart(ip, user) {
+function canStart(ip, user, custom) {
   const now = Date.now();
   const list = (ipJobs.get(ip) || []).filter(t => now - t < 3600000);
+  if (!ipJobs.has(ip)) capMap(ipJobs, l => l.some(t => now - t < 3600000));
   ipJobs.set(ip, list);
   if (list.length >= JOBS_PER_IP_HOUR) return 'limit';
-  let byIp = 0, byUser = 0;
-  for (const j of jobs.values()) { if (j.ip === ip) byIp++; if (j.user === user) byUser++; }
-  if (jobs.size >= MAX_JOBS || byIp >= JOBS_PER_USER || byUser >= JOBS_PER_USER) return 'busy';
+  let byIp = 0, byUser = 0, byCustom = 0;
+  for (const j of jobs.values()) { if (j.ip === ip) byIp++; if (j.user === user) byUser++; if (j.custom) byCustom++; }
+  if (jobs.size >= MAX_JOBS || byIp >= JOBS_PER_USER || byUser >= JOBS_PER_USER || (custom && byCustom >= CUSTOM_JOBS)) return 'busy';
   list.push(now);
   return '';
 }
@@ -452,15 +505,16 @@ function startTranslation(cfg, key, sourceUrl, ctx, ip) {
   const f = failures.get(id);
   if (f && Date.now() - f.at < 120000) return '';
   const user = userTag(cfg);
-  const blocked = canStart(ip, user);
+  const custom = cfg.p === 'custom';
+  const blocked = canStart(ip, user, custom);
   if (blocked) return blocked;
   failures.delete(id);
-  const job = { cues: null, done: 0, total: 0, ip, user };
+  const job = { cues: null, done: 0, total: 0, ip, user, custom };
   jobs.set(id, job);
   const deadline = Date.now() + JOB_DEADLINE;
   (async () => {
     try {
-      const cues = parseSrt(await fetchText(sourceUrl));
+      const cues = parseSrt(await fetchText(sourceUrl, { maxBytes: MAX_SOURCE }));
       if (!cues.length) throw userError('empty source subtitle');
       job.cues = cues.map(c => ({ ...c }));
       const batches = [];
@@ -728,7 +782,7 @@ function configFromForm(f) {
   return cfg;
 }
 
-async function handleApi(req, res, name) {
+async function handleApi(req, res, name, ip) {
   let f;
   try { f = await readJson(req); } catch { return send(res, 400, { error: 'Invalid request.' }); }
   let cfg;
@@ -740,41 +794,59 @@ async function handleApi(req, res, name) {
       log(`install ${cfg.p}/${cfg.m} → ${cfg.l} x${cfg.n}`);
       return send(res, 200, { manifest, stremio: manifest.replace(/^https?:\/\//, 'stremio://') });
     }
-    if (name === 'models') return send(res, 200, { models: await listModels(cfg) });
-    if (name === 'test') {
+    if (name !== 'models' && name !== 'test') return send(res, 404, { error: 'not found' });
+    // these call the user's AI right away, so only a few may run at once
+    if (apiRunning.size >= API_TOTAL || (apiByIp.get(ip) || 0) >= API_PER_IP) {
+      return send(res, 429, { error: 'Too many checks running. Wait a moment and try again.' });
+    }
+    const run = Symbol(ip);
+    apiRunning.add(run);
+    apiByIp.set(ip, (apiByIp.get(ip) || 0) + 1);
+    try {
+      if (name === 'models') return send(res, 200, { models: await listModels(cfg) });
       const out = await chat(cfg, systemPrompt(cfg.l, null), JSON.stringify({ 0: 'Hey, are you okay? The ambulance is on its way.' }), 45000);
       const json = parseAnswer(out.slice(out.indexOf('{'), out.lastIndexOf('}') + 1)) || {};
       if (typeof json[0] !== 'string') throw userError('the model did not answer in the expected format');
       return send(res, 200, { sample: json[0] });
+    } finally {
+      apiRunning.delete(run);
+      const left = (apiByIp.get(ip) || 1) - 1;
+      if (left > 0) apiByIp.set(ip, left); else apiByIp.delete(ip);
     }
   } catch (e) {
     return send(res, 200, { error: `Failed: ${friendlyError(e)}.` });
   }
-  send(res, 404, { error: 'not found' });
 }
+const apiRunning = new Set();
+const apiByIp = new Map(); // ip → calls running
 
 // ---------- server ----------
 
 const server = http.createServer(async (req, res) => {
   const ip = clientIp(req);
   try {
-    if (req.method === 'OPTIONS') return send(res, 204, '');
     const url = new URL(req.url, 'http://x');
     // accept with or without the prefix (the proxy may pass the full path)
     let p = url.pathname;
     if (BASE_PATH && (p === BASE_PATH || p.startsWith(`${BASE_PATH}/`))) p = p.slice(BASE_PATH.length) || '/';
+    let m = p.match(/^\/api\/(config|models|test)$/);
+    // the API is only for the configure page itself: no CORS, and other sites' pages can't call it
+    if (m) {
+      const origin = req.headers.origin;
+      if (req.method !== 'POST' || (origin && origin !== PUBLIC_ORIGIN)) return send(res, 403, { error: 'forbidden' }, undefined, NO_CORS);
+      if (tooManyRequests(ip)) return send(res, 429, { error: 'Too many requests. Wait a minute and try again.' }, undefined, NO_CORS);
+      return handleApi(req, res, m[1], ip);
+    }
+    if (req.method === 'OPTIONS') return send(res, 204, '');
+    // the configure page can't be framed by another site
     const html = 'text/html; charset=utf-8';
+    const page = { 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "frame-ancestors 'none'" };
 
     if (p === '/health') return send(res, 200, { ok: true, jobs: jobs.size });
     if (p === '/' ) return send(res, 302, '', 'text/plain', { Location: `${PUBLIC_URL}/configure` });
-    if (p === '/configure') return send(res, 200, configurePage(null, ''), html);
+    if (p === '/configure') return send(res, 200, configurePage(null, ''), html, page);
     if (p === '/manifest.json') {
       return send(res, 200, { ...manifestBase, behaviorHints: { configurable: true, configurationRequired: true } });
-    }
-    let m = p.match(/^\/api\/(config|models|test)$/);
-    if (m && req.method === 'POST') {
-      if (tooManyRequests(ip)) return send(res, 429, { error: 'Too many requests. Wait a minute and try again.' });
-      return handleApi(req, res, m[1]);
     }
 
     // from here on: /{config}/...
@@ -791,7 +863,7 @@ const server = http.createServer(async (req, res) => {
       const L = LANG[cfg.l];
       return send(res, 200, { ...manifestBase, description: `${manifestBase.description} Translating into ${L.name}.`, behaviorHints: { configurable: true } });
     }
-    if (rest === '/configure') return send(res, 200, configurePage(cfg, token), html);
+    if (rest === '/configure') return send(res, 200, configurePage(cfg, token), html, page);
 
     // /subtitles/{type}/{id}.json  or  /subtitles/{type}/{id}/{extra}.json
     m = rest.match(/^\/subtitles\/(movie|series)\/([^/]+?)(?:\/(.+))?\.json$/);
