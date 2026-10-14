@@ -4,4 +4,6 @@ beamup.json
 node_modules/
 .playwright-mcp/
 *.png
-ARQUITETURA.md
+# notes and docs stay local; only the README is published
+*.md
+!README.md
