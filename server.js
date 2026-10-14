@@ -24,10 +24,19 @@ const CACHE_TTL_HOURS = Number(process.env.CACHE_TTL_HOURS || 24); // a translat
 const JOBS_PER_IP_HOUR = Number(process.env.JOBS_PER_IP_HOUR || 30);
 const MAX_JOBS = Number(process.env.MAX_JOBS || 10);
 const REQS_PER_IP_MIN = Number(process.env.REQS_PER_IP_MIN || 60); // per IP per minute: lists and /api, and separately .srt files
-const UPSTREAM_PER_MIN = Number(process.env.UPSTREAM_PER_MIN || 120); // OpenSubtitles + Cinemeta calls per minute, all users together
+const UPSTREAM_PER_MIN = Number(process.env.UPSTREAM_PER_MIN || 300); // calls to OpenSubtitles + Cinemeta per minute, all users together
+const UPSTREAM_PER_IP_MIN = 10;          // of those, per IP (IPv6: per /64, and 3× that per /48)
+// proxies allowed to set REAL_IP_HEADER, besides private and loopback addresses (IPs or CIDRs, comma-separated)
+const TRUSTED_PROXIES = new net.BlockList();
+for (const t of (process.env.TRUSTED_PROXIES || '').split(',').map(s => s.trim()).filter(Boolean)) {
+  const [a, n] = t.split('/');
+  const fam = net.isIPv6(a) ? 'ipv6' : 'ipv4';
+  if (n) TRUSTED_PROXIES.addSubnet(a, Number(n), fam); else TRUSTED_PROXIES.addAddress(a, fam);
+}
 const ALLOW_CUSTOM = process.env.ALLOW_CUSTOM_PROVIDER !== 'false';
 const JOBS_PER_USER = 2;                 // concurrent translations per IP and per key
 const JOB_DEADLINE = 10 * 60000;         // a translation still running after this is dropped
+const CUSTOM_DEADLINE = 5 * 60000;       // same, on a custom endpoint
 const REAL_IP_HOPS = Math.max(1, Number(process.env.REAL_IP_HOPS || 1)); // proxies that append to REAL_IP_HEADER
 const MAX_ANSWER = 2 * 1048576;          // largest AI / metadata answer read
 const MAX_SOURCE = 16 * 1048576;         // largest source subtitle read
@@ -99,7 +108,8 @@ const userError = msg => Object.assign(new Error(msg), { expose: true });
 
 // every outbound request: https only, redirects refused, body capped (opts.maxBytes, MAX_ANSWER by default). With
 // guard (custom endpoints) the address is checked by the same lookup the socket connects with, so DNS rebinding
-// can't swap it afterwards.
+// can't swap it afterwards. opts.signal (AbortSignal) cancels the request and closes its socket.
+const abortedError = () => Object.assign(new Error('cancelled'), { aborted: true });
 function fetchText(url, opts = {}, timeoutMs = 30000, guard = false) {
   const maxBytes = opts.maxBytes || MAX_ANSWER;
   return new Promise((resolve, reject) => {
@@ -108,11 +118,14 @@ function fetchText(url, opts = {}, timeoutMs = 30000, guard = false) {
     if (u.protocol !== 'https:') return reject(userError('only https:// addresses are allowed'));
     const host = u.hostname.replace(/^\[|\]$/g, '');
     if (guard && net.isIP(host) && !publicIp(host)) return reject(privateError());
+    if (opts.signal && opts.signal.aborted) return reject(abortedError());
     let settled = false;
+    const onAbort = () => finish(abortedError());
     const finish = (err, val) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (opts.signal) opts.signal.removeEventListener('abort', onAbort);
       if (err) { req.destroy(); reject(err); } else resolve(val);
     };
     const headers = { ...(opts.headers || {}) };
@@ -139,6 +152,7 @@ function fetchText(url, opts = {}, timeoutMs = 30000, guard = false) {
     const timer = setTimeout(() => finish(Object.assign(new Error('timeout'), { name: 'AbortError' })), Math.max(1, timeoutMs));
     req.on('error', finish);
     req.on('close', () => finish(new Error('connection closed')));
+    if (opts.signal) opts.signal.addEventListener('abort', onAbort);
     if (opts.body) req.write(opts.body);
     req.end();
   });
@@ -157,21 +171,36 @@ function ipBucket(ip) {
   return `${full.slice(0, 4).map(x => x.padStart(4, '0')).join(':')}::/64`;
 }
 
-// a proxy appends the address it saw to the right end of the header; values to its left come from the client
-let warnedMulti = false;
+// a proxy appends the address it saw to the right end of the header; values to its left come from the client.
+// The header only counts when the connection comes from the proxy itself (private/loopback or TRUSTED_PROXIES):
+// a client reaching the app port directly can't pick its own IP.
+let warnedMulti = false, warnedUntrusted = false;
 function clientIp(req) {
+  const peer = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
   const h = REAL_IP_HEADER && req.headers[REAL_IP_HEADER];
   let ip = '';
   if (h) {
-    const list = String(h).split(',').map(s => s.trim()).filter(Boolean);
-    if (list.length > 1 && REAL_IP_HOPS === 1 && !warnedMulti) {
-      warnedMulti = true;
-      log(`warning: ${REAL_IP_HEADER} has several values; using the last one. Set REAL_IP_HOPS if more than one proxy appends to it.`);
+    const trusted = !publicIp(peer) || TRUSTED_PROXIES.check(peer, net.isIPv6(peer) ? 'ipv6' : 'ipv4');
+    if (!trusted) {
+      if (!warnedUntrusted) {
+        warnedUntrusted = true;
+        log(`warning: ${REAL_IP_HEADER} came from ${peer}, which is not a trusted proxy; ignored. Add it to TRUSTED_PROXIES if it is your proxy.`);
+      }
+    } else {
+      const list = String(h).split(',').map(s => s.trim()).filter(Boolean);
+      if (list.length > 1 && REAL_IP_HOPS === 1 && !warnedMulti) {
+        warnedMulti = true;
+        log(`warning: ${REAL_IP_HEADER} has several values; using the last one. Set REAL_IP_HOPS if more than one proxy appends to it.`);
+      }
+      const cand = (list[list.length - REAL_IP_HOPS] || '').replace(/^::ffff:/, '');
+      if (net.isIP(cand)) ip = cand;
     }
-    ip = list[list.length - REAL_IP_HOPS] || '';
   }
-  return ipBucket(ip || req.socket.remoteAddress || '?');
+  return ipBucket(ip || peer || '?');
 }
+
+// the /48 around an IPv6 /64 bucket (tunnel brokers hand out whole /48s); IPv4 stays as it is
+const wideBucket = b => (b.endsWith('::/64') ? `${b.split(':').slice(0, 3).join(':')}::/48` : b);
 
 // keeps per-IP tables bounded even if someone sprays addresses between the regular cleanups
 function capMap(map, alive) {
@@ -183,25 +212,31 @@ function capMap(map, alive) {
 // sliding one-minute window per IP: lists and /api in ipHits, subtitle files in srtHits
 const ipHits = new Map(); // ip → [timestamps]
 const srtHits = new Map();
-function tooManyRequests(ip, table = ipHits) {
+function tooManyRequests(ip, table = ipHits, limit = REQS_PER_IP_MIN) {
   const now = Date.now();
   const list = (table.get(ip) || []).filter(t => now - t < 60000);
   list.push(now);
   if (!table.has(ip)) capMap(table, l => l.some(t => now - t < 60000));
   table.set(ip, list);
-  return list.length > REQS_PER_IP_MIN;
+  return list.length > limit;
 }
 
-// calls to OpenSubtitles and Cinemeta: one cap for all users together, so many addresses can't turn the server
-// into a source of traffic against them; identical calls made at the same moment share one request
+// calls to OpenSubtitles and Cinemeta (lists, title info and source subtitle downloads): a small share per IP
+// inside one cap for all users, so neither one client nor many addresses can turn the server into a source of
+// traffic against them. Identical calls made at the same moment share one request and cost nothing extra.
 let upMinute = 0, upCount = 0;
 const inflight = new Map(); // url → promise
-function fetchUpstream(url, timeoutMs) {
+const upHits = new Map();   // ip bucket (and its /48) → [timestamps]
+const busyError = () => Object.assign(userError('server busy, try again in a minute'), { busy: true });
+function fetchUpstream(url, timeoutMs, ip, opts = {}) {
   if (inflight.has(url)) return inflight.get(url);
+  const wide = wideBucket(ip);
+  if (tooManyRequests(ip, upHits, UPSTREAM_PER_IP_MIN) ||
+      (wide !== ip && tooManyRequests(wide, upHits, UPSTREAM_PER_IP_MIN * 3))) return Promise.reject(busyError());
   const minute = Math.floor(Date.now() / 60000);
   if (minute !== upMinute) { upMinute = minute; upCount = 0; }
-  if (++upCount > UPSTREAM_PER_MIN) return Promise.reject(Object.assign(new Error('upstream limit reached'), { busy: true }));
-  const p = fetchText(url, {}, timeoutMs).finally(() => inflight.delete(url));
+  if (++upCount > UPSTREAM_PER_MIN) return Promise.reject(busyError());
+  const p = fetchText(url, opts, timeoutMs).finally(() => inflight.delete(url));
   inflight.set(url, p);
   return p;
 }
@@ -275,16 +310,21 @@ function publicIp(ip) {
 // the same message whether the name doesn't exist or points inside, so internal names can't be probed
 const privateError = () => userError('the custom endpoint must be a reachable public address');
 
-// used by the socket itself to resolve custom endpoints: refuses the connection if any address isn't public
+// used by the socket itself to resolve custom endpoints: refuses the connection if any address isn't public.
+// Asks DNS directly (with its own timeout) instead of the system resolver, which runs on Node's small thread pool:
+// a nameserver that never answers can't stall file reads and other lookups for everyone.
+const resolver = new dns.Resolver({ timeout: 4000, tries: 2 });
 function guardedLookup(host, opts, cb) {
   if (typeof opts === 'function') { cb = opts; opts = {}; }
   if (typeof opts === 'number') opts = { family: opts };
-  dns.lookup(host, { all: true }).then(found => {
+  const ask = (family, q) => q.then(list => list.map(address => ({ address, family })), () => []);
+  Promise.all([ask(4, resolver.resolve4(host)), ask(6, resolver.resolve6(host))]).then(([v4, v6]) => {
+    const found = [...v4, ...v6];
     const addrs = opts.family ? found.filter(a => a.family === opts.family) : found;
     if (!addrs.length || found.some(a => !publicIp(a.address))) return cb(privateError());
     if (opts.all) cb(null, addrs);
     else cb(null, addrs[0].address, addrs[0].family);
-  }, () => cb(privateError()));
+  });
 }
 // no keep-alive: a socket to a custom host closes with its request, so idle connections can't pile up
 const guardedAgent = new https.Agent({ keepAlive: false, maxTotalSockets: 50, lookup: guardedLookup });
@@ -299,7 +339,7 @@ function parseAnswer(raw) {
 }
 
 // deadline (optional) cuts the request when the whole translation runs out of time
-async function chat(cfg, system, user, timeoutMs = 120000, deadline = Infinity) {
+async function chat(cfg, system, user, timeoutMs = 120000, deadline = Infinity, signal) {
   const base = baseUrl(cfg);
   const guard = cfg.p === 'custom';
   timeoutMs = Math.min(timeoutMs, guard ? CUSTOM_TIMEOUT : timeoutMs, deadline - Date.now());
@@ -308,6 +348,7 @@ async function chat(cfg, system, user, timeoutMs = 120000, deadline = Infinity) 
       method: 'POST',
       headers: { 'x-api-key': cfg.k, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       body: JSON.stringify({ model: cfg.m, max_tokens: 16000, system, messages: [{ role: 'user', content: user }] }),
+      signal,
     }, timeoutMs, guard);
     const content = parseAnswer(raw).content;
     return (Array.isArray(content) ? content : []).filter(b => b && b.type === 'text').map(b => String(b.text)).join('');
@@ -320,6 +361,7 @@ async function chat(cfg, system, user, timeoutMs = 120000, deadline = Infinity) 
       stream: false,
       messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
     }),
+    signal,
   }, timeoutMs, guard);
   const msg = (((parseAnswer(raw) || {}).choices || [])[0] || {}).message;
   return msg && typeof msg.content === 'string' ? msg.content : '';
@@ -382,13 +424,13 @@ the same ids, each value being the translation. Do not merge or skip ids.` +
 
 // title context (name, genre, plot) from Cinemeta; null if not found
 const metaCache = new Map();
-async function titleContext(type, id) {
+async function titleContext(type, id, ip) {
   const imdb = id.split(':')[0];
   if (!/^tt\d{1,12}$/.test(imdb)) return null;
   if (metaCache.has(imdb)) return metaCache.get(imdb);
   let ctx = null;
   try {
-    const { meta } = JSON.parse(await fetchUpstream(`${CINEMETA}/meta/${type}/${imdb}.json`, 8000));
+    const { meta } = JSON.parse(await fetchUpstream(`${CINEMETA}/meta/${type}/${imdb}.json`, 8000, ip));
     if (meta && meta.name) {
       ctx = `Title: ${meta.name}${meta.year ? ` (${meta.year})` : ''}` +
         (meta.genre && meta.genre.length ? `\nGenre: ${meta.genre.join(', ')}` : '') +
@@ -406,22 +448,25 @@ async function titleContext(type, id) {
 // a translated line much longer than its source is not a translation: keep the English instead
 const fits = (out, src) => typeof out === 'string' && out.trim() !== '' && out.length <= src.length * 4 + 40;
 
-async function translateBatch(cfg, system, batch, deadline) {
+async function translateBatch(cfg, system, batch, deadline, signal) {
   const input = {};
   batch.forEach(c => { input[c.idx] = c.text; });
   let last;
   for (let attempt = 1; attempt <= 4; attempt++) {
+    if (signal && signal.aborted) throw abortedError();
     if (Date.now() > deadline) throw userError('the translation took too long');
     try {
-      const content = await chat(cfg, system, JSON.stringify(input), 120000, deadline);
+      const content = await chat(cfg, system, JSON.stringify(input), 120000, deadline, signal);
       const json = parseAnswer(content.slice(content.indexOf('{'), content.lastIndexOf('}') + 1)) || {};
       return batch.map(c => (fits(json[c.idx], c.text) ? json[c.idx] : c.text));
     } catch (e) {
       last = e;
+      if (e.aborted) throw e;
       // retrying won't help (an unreadable answer is the only exposed error worth another try)
       if ([401, 402, 403, 404].includes(e.status) || (e.status >= 300 && e.status < 400) || (e.expose && !e.retry)) throw e;
-      // a custom endpoint that already sat on a request for a full minute doesn't get another one
-      if (e.name === 'AbortError' && (cfg.p === 'custom' || Date.now() >= deadline)) throw e;
+      // a custom endpoint that sat on a request for a full minute, or failed on its side, doesn't get another one
+      if (cfg.p === 'custom' && (e.name === 'AbortError' || e.status >= 500)) throw e;
+      if (e.name === 'AbortError' && Date.now() >= deadline) throw e;
       await sleep(e.status === 429 ? Math.min(30, e.retryAfter || 5 * attempt) * 1000 : 1000 * attempt);
     }
   }
@@ -438,8 +483,12 @@ function parseSrt(text) {
     const lines = b.split('\n');
     const i = lines.findIndex(l => l.includes('-->'));
     if (i < 0) continue;
+    // a cue whose time line doesn't parse is left out (the info cue does arithmetic on these)
+    const t = lines[i].match(/(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})/);
+    if (!t) continue;
+    const ts = (h, m, s, ms) => `${h.padStart(2, '0')}:${m}:${s},${ms.padEnd(3, '0')}`;
     const body = lines.slice(i + 1).join('\n').trim();
-    if (body) cues.push({ time: lines[i].trim(), text: body });
+    if (body) cues.push({ time: `${ts(t[1], t[2], t[3], t[4])} --> ${ts(t[5], t[6], t[7], t[8])}`, text: body });
   }
   return cues;
 }
@@ -529,10 +578,12 @@ function startTranslation(cfg, key, sourceUrl, ctx, ip) {
   failures.delete(id);
   const job = { cues: null, done: 0, total: 0, ip, user, custom };
   jobs.set(id, job);
-  const deadline = Date.now() + JOB_DEADLINE;
+  const deadline = Date.now() + (custom ? CUSTOM_DEADLINE : JOB_DEADLINE);
+  // the first failure cancels the other requests of this job, so none keeps running unaccounted for
+  const stop = new AbortController();
   (async () => {
     try {
-      const cues = parseSrt(await fetchText(sourceUrl, { maxBytes: MAX_SOURCE }));
+      const cues = parseSrt(await fetchUpstream(sourceUrl, 30000, ip, { maxBytes: MAX_SOURCE }));
       if (!cues.length) throw userError('empty source subtitle');
       job.cues = cues.map(c => ({ ...c }));
       const batches = [];
@@ -542,16 +593,23 @@ function startTranslation(cfg, key, sourceUrl, ctx, ip) {
       job.total = batches.length;
       const system = systemPrompt(cfg.l, ctx);
       log(`translating ${cfg.l}/${key} (${cfg.p}/${cfg.m}): ${cues.length} lines, ${batches.length} batches`);
-      let next = 0;
+      let next = 0, failed = null;
       const worker = async () => {
-        while (next < batches.length) {
-          const b = batches[next++];
-          const out = await translateBatch(cfg, system, b, deadline);
-          b.forEach((c, j) => { job.cues[c.idx].text = out[j]; job.cues[c.idx].ok = true; });
-          job.done++;
+        try {
+          while (next < batches.length && !stop.signal.aborted) {
+            const b = batches[next++];
+            const out = await translateBatch(cfg, system, b, deadline, stop.signal);
+            b.forEach((c, j) => { job.cues[c.idx].text = out[j]; job.cues[c.idx].ok = true; });
+            job.done++;
+          }
+        } catch (e) {
+          if (!failed) failed = e;
+          stop.abort();
         }
       };
+      // the job stays counted until every worker has finished
       await Promise.all(Array.from({ length: PARALLEL }, worker));
+      if (failed) throw failed;
       const srt = buildSrt(job.cues);
       fs.mkdirSync(path.dirname(file), { recursive: true });
       fs.writeFileSync(file, srt);
@@ -623,20 +681,27 @@ const encodeSrc = url => Buffer.from(url).toString('base64url');
 const decodeSrc = s => Buffer.from(s, 'base64url').toString();
 const keyFor = url => crypto.createHash('sha256').update(url).digest('hex').slice(0, 24);
 
-// stored when Stremio asks for the list (before asking for the .srt): title context and option info
+// stored when Stremio asks for the list (before asking for the .srt): title context and option info. Also the
+// record of which sources this server handed out: a translation only starts for a source that came from a list,
+// so nobody can make the server download arbitrary files. Oldest entries go first.
 const subMeta = new Map(); // `${lang}/${key}` → { ctx, info }
+function issue(k, v) {
+  subMeta.delete(k);
+  subMeta.set(k, v);
+  while (subMeta.size > 20000) subMeta.delete(subMeta.keys().next().value);
+}
 
 // OpenSubtitles answers are reused for 10 minutes, so repeated requests don't hit them again
 const listCache = new Map(); // url → { at, subs }
-async function englishSubs(type, id, extra) {
+async function englishSubs(type, id, extra, ip) {
   const url = `${OPENSUBS}/subtitles/${type}/${encodeURIComponent(id)}${extra ? `/${extra}` : ''}.json`;
   const hit = listCache.get(url);
   if (hit && Date.now() - hit.at < 600000) return hit.subs;
   let data;
   try {
-    data = JSON.parse(await fetchUpstream(url, 20000));
+    data = JSON.parse(await fetchUpstream(url, 20000, ip));
   } catch (e) {
-    if (e.busy) return []; // over the shared cap: an empty list now, a fresh try on the next request
+    if (e.busy) return []; // over the cap: an empty list now, a fresh try on the next request
     throw e;
   }
   const subs = (Array.isArray(data.subtitles) ? data.subtitles : [])
@@ -647,12 +712,12 @@ async function englishSubs(type, id, extra) {
 }
 
 async function handleSubtitles(cfg, token, type, id, extra, ip) {
-  const english = (await englishSubs(type, id, extra)).slice(0, cfg.n);
-  const ctx = await titleContext(type, id);
-  if (subMeta.size > 20000) subMeta.clear();
+  const english = (await englishSubs(type, id, extra, ip)).slice(0, cfg.n);
+  if (!english.length) return [];
+  const ctx = await titleContext(type, id, ip);
   return english.map((s, i) => {
     const key = keyFor(s.url);
-    subMeta.set(`${cfg.l}/${key}`, { ctx, info: describeSource(s, i, english.length, cfg.l) });
+    issue(`${cfg.l}/${key}`, { ctx, info: describeSource(s, i, english.length, cfg.l) });
     if (i === 0) startTranslation(cfg, key, s.url, ctx, ip); // start translating the best option right away
     return {
       id: `ai-${cfg.l}-${key}`,
@@ -695,9 +760,10 @@ async function serveSub(res, cfg, key, src, ip) {
   if (!/^https:\/\/[\w.-]+\.strem\.io\//.test(srcUrl) || keyFor(srcUrl) !== key) {
     return send(res, 400, { error: 'invalid source' });
   }
-  const meta = subMeta.get(`${cfg.l}/${key}`) || {};
+  const meta = subMeta.get(`${cfg.l}/${key}`);
   const file = cachePath(cfg, key);
-  const k = `${file}\n${meta.info || ''}`;
+  const info = meta ? meta.info : '';
+  const k = `${file}\n${info}`;
   let hit = ready.get(k);
   if (hit) {
     ready.delete(k);
@@ -706,7 +772,7 @@ async function serveSub(res, cfg, key, src, ip) {
     let text = null;
     try { text = await fs.promises.readFile(file, 'utf8'); } catch {}
     if (text !== null) {
-      hit = { body: Buffer.from(buildSrt(withInfo(parseSrt(text), meta.info))) };
+      hit = { body: Buffer.from(buildSrt(withInfo(parseSrt(text), info))) };
       remember(k, hit.body);
     }
   }
@@ -714,8 +780,10 @@ async function serveSub(res, cfg, key, src, ip) {
     touch(file);
     return send(res, 200, hit.body, srt);
   }
+  // not translated yet: only for a source this server listed (after a restart the app asks for the list again)
+  if (!meta) return send(res, 200, noteSrt([ui(cfg.l).reopen]), srt);
   const blocked = startTranslation(cfg, key, srcUrl, meta.ctx || null, ip);
-  return send(res, 200, progressSrt(cfg, key, meta.info, blocked), srt);
+  return send(res, 200, progressSrt(cfg, key, info, blocked), srt);
 }
 
 // ---------- configuration page ----------
@@ -848,38 +916,39 @@ function configFromForm(f) {
 }
 
 async function handleApi(req, res, name, ip) {
+  const reply = (status, body) => send(res, status, body, undefined, NO_CORS); // same-origin page only
   let f;
-  try { f = await readJson(req); } catch { return send(res, 400, { error: 'Invalid request.' }); }
+  try { f = await readJson(req); } catch { return reply(400, { error: 'Invalid request.' }); }
   let cfg;
-  try { cfg = configFromForm({ ...f, l: f.l || 'pob' }); } catch (e) { return send(res, 200, { error: e.message }); }
+  try { cfg = configFromForm({ ...f, l: f.l || 'pob' }); } catch (e) { return reply(200, { error: e.message }); }
   try {
     if (name === 'config') {
       const token = sealConfig(cfg);
       const manifest = `${PUBLIC_URL}/${token}/manifest.json`;
       log(`install ${cfg.p}/${cfg.m} → ${cfg.l} x${cfg.n}`);
-      return send(res, 200, { manifest, stremio: manifest.replace(/^https?:\/\//, 'stremio://') });
+      return reply(200, { manifest, stremio: manifest.replace(/^https?:\/\//, 'stremio://') });
     }
-    if (name !== 'models' && name !== 'test') return send(res, 404, { error: 'not found' });
+    if (name !== 'models' && name !== 'test') return reply(404, { error: 'not found' });
     // these call the user's AI right away, so only a few may run at once
     if (apiRunning.size >= API_TOTAL || (apiByIp.get(ip) || 0) >= API_PER_IP) {
-      return send(res, 429, { error: 'Too many checks running. Wait a moment and try again.' });
+      return reply(429, { error: 'Too many checks running. Wait a moment and try again.' });
     }
     const run = Symbol(ip);
     apiRunning.add(run);
     apiByIp.set(ip, (apiByIp.get(ip) || 0) + 1);
     try {
-      if (name === 'models') return send(res, 200, { models: await listModels(cfg) });
+      if (name === 'models') return reply(200, { models: await listModels(cfg) });
       const out = await chat(cfg, systemPrompt(cfg.l, null), JSON.stringify({ 0: 'Hey, are you okay? The ambulance is on its way.' }), 45000);
       const json = parseAnswer(out.slice(out.indexOf('{'), out.lastIndexOf('}') + 1)) || {};
       if (typeof json[0] !== 'string') throw userError('the model did not answer in the expected format');
-      return send(res, 200, { sample: json[0] });
+      return reply(200, { sample: json[0] });
     } finally {
       apiRunning.delete(run);
       const left = (apiByIp.get(ip) || 1) - 1;
       if (left > 0) apiByIp.set(ip, left); else apiByIp.delete(ip);
     }
   } catch (e) {
-    return send(res, 200, { error: `Failed: ${friendlyError(e)}.` });
+    return reply(200, { error: `Failed: ${friendlyError(e)}.` });
   }
 }
 const apiRunning = new Set();
@@ -964,6 +1033,6 @@ setInterval(cleanCache, 3600000).unref();
 setInterval(() => {
   const now = Date.now();
   for (const [ip, l] of ipJobs) if (!l.some(t => now - t < 3600000)) ipJobs.delete(ip);
-  for (const t of [ipHits, srtHits]) for (const [ip, l] of t) if (!l.some(x => now - x < 60000)) t.delete(ip);
+  for (const t of [ipHits, srtHits, upHits]) for (const [ip, l] of t) if (!l.some(x => now - x < 60000)) t.delete(ip);
 }, 600000).unref();
 server.listen(PORT, HOST, () => log(`AI Subtitles on ${PUBLIC_URL}/configure`));

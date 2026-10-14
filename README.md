@@ -30,7 +30,7 @@ Put it behind HTTPS: Stremio apps only load addons over HTTPS (except on localho
 
 ```sh
 docker build -t ai-subtitles .
-docker run -d -p 7311:7311 \
+docker run -d -p 127.0.0.1:7311:7311 \
   -e CONFIG_SECRET="$(openssl rand -hex 32)" \
   -e PUBLIC_URL=https://subtitles.example.com \
   -e REAL_IP_HEADER=x-real-ip \
@@ -38,8 +38,9 @@ docker run -d -p 7311:7311 \
   ai-subtitles
 ```
 
-Set `REAL_IP_HEADER` to the header your reverse proxy writes (see below); without it, every user
-shares the proxy's address and one rate limit.
+The port is published on localhost only, for a reverse proxy on the same machine. Set
+`REAL_IP_HEADER` to the header that proxy writes (see below); without it, every user shares the
+proxy's address and one rate limit.
 
 Runs as a non-root user, has a healthcheck on `/health`, and keeps finished translations in
 `/app/cache` (mount a volume so they survive updates). Keep `CONFIG_SECRET` the same across
@@ -56,7 +57,9 @@ Read this before opening your instance to other people.
 - **Set `REAL_IP_HEADER`.** Behind a reverse proxy, every user otherwise shares one IP and one rate
   limit. Prefer a header your proxy overwrites (`x-real-ip`, `cf-connecting-ip`). With
   `x-forwarded-for`, which proxies append to, the IP is read from the right; set `REAL_IP_HOPS`
-  to the number of proxies in front of the app, or users can fake their IP.
+  to the number of proxies in front of the app, or users can fake their IP. The header is only
+  read from private or loopback addresses; if your proxy reaches the app from a public address,
+  list it in `TRUSTED_PROXIES`.
 - **The custom provider makes outbound requests to URLs your users choose.** Private and reserved
   addresses, redirects and oversized answers are refused, but set `ALLOW_CUSTOM_PROVIDER=false`
   if you don't want that at all. Don't route outbound traffic through an HTTP proxy
@@ -70,13 +73,14 @@ Read this before opening your instance to other people.
 | `PUBLIC_URL` | `http://HOST:PORT` | Public HTTPS address, with the path if it lives in a subfolder. |
 | `REAL_IP_HEADER` | none | Header with the client IP set by your proxy. |
 | `REAL_IP_HOPS` | `1` | How many proxies append to that header; the IP is read that many places from the right. |
+| `TRUSTED_PROXIES` | none | Public proxy addresses (IPs or CIDRs, comma-separated) allowed to set that header. |
 | `ALLOW_CUSTOM_PROVIDER` | `true` | Offer the custom OpenAI-compatible endpoint. |
 | `CACHE_TTL_HOURS` | `24` | Delete a translation this long after its last use. |
 | `CACHE_MAX_MB` | `2000` | Disk cap for translations; the least recently used go first. |
 | `JOBS_PER_IP_HOUR` | `30` | New translations per IP per hour. |
 | `MAX_JOBS` | `10` | Translations running at once (at most 2 per IP, 2 per key and 4 on custom endpoints). |
 | `REQS_PER_IP_MIN` | `60` | Per IP per minute: subtitle lists and `/api` calls, and separately subtitle files. |
-| `UPSTREAM_PER_MIN` | `120` | Calls to OpenSubtitles and Cinemeta per minute, all users together. |
+| `UPSTREAM_PER_MIN` | `300` | Calls to OpenSubtitles and Cinemeta per minute, all users together (10 per IP). |
 
 ### BeamUp
 
